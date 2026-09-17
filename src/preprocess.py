@@ -3,7 +3,7 @@
 Приводит сырые parquet-файлы из `dataset/` к рабочему виду и складывает
 результат в `dataset/processed/`.
 
-Что делает на текущем шаге:
+Что делает:
 
 1. Удаляет вырожденные колонки запроса (`search_category`,
    `search_is_delivery_search`) — см. обоснование в `notebooks/01_eda.ipynb`.
@@ -12,6 +12,17 @@
 2. Приводит `decimal128`-колонки (`item_price`, `item_latitude`,
    `item_longitude`) к `float64` — в pandas они иначе приходят объектами
    `Decimal`, с которыми не работает ни арифметика, ни модели.
+3. Разбирает `infm_params_text` модулем `infm_params`: добавляет фильтры
+   запроса `filter_*`, поля объявления `item_*` и текст для ретрива
+   `item_params_text` (см. `notebooks/02_infm_params.ipynb`).
+4. Удаляет разобранные исходные тексты (`search_infm_params_text`,
+   `item_infm_params_text`) и заменяет `item_category_id` флагом
+   `item_is_service`.
+5. Ставит колонки в порядке: сначала поля запроса (`query_id`, `search_*`,
+   `filter_*`), затем поля объявления.
+
+Исходные файлы в `dataset/` не меняются, поэтому при доработке словаря
+ключей достаточно перезапустить скрипт.
 
 Файлы обрабатываются потоково (batch → batch), поэтому пиковая память не
 зависит от размера входа.
@@ -32,6 +43,9 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import infm_params as ip
+
 # --- конфигурация ------------------------------------------------------------
 
 #: Вырожденные колонки запроса. Обоснование (EDA, раздел 3.2 и 9):
@@ -51,6 +65,38 @@ DECIMAL_COLUMNS: tuple[str, ...] = (
     "item_latitude",
     "item_longitude",
 )
+
+#: Колонки, которые удаляются после разбора: их содержимое разложено
+#: по `filter_*` / `item_*`.
+DROP_AFTER_PARSING: tuple[str, ...] = (
+    "search_infm_params_text",
+    "item_infm_params_text",
+)
+
+#: `item_category_id` заменяется флагом: сам идентификатор в train равен 114
+#: у 99.997% строк, но в корпусе 1 876 объявлений (1%) — не услуги, а товары
+#: (категории 19, 112, 40, 33). Флаг сохраняет это различие.
+SERVICE_CATEGORY_ID = 114
+SERVICE_FLAG = "item_is_service"
+
+#: Новые колонки и их типы. Типы заданы явно: иначе батч, где все списки
+#: пустые, получил бы тип list<null> и схема поехала бы между батчами.
+QUERY_FIELDS: dict[str, pa.DataType] = {
+    "filter_category": pa.string(),
+    "filter_subcategory": pa.list_(pa.string()),
+    "filter_subject": pa.list_(pa.string()),
+    "filter_online_booking": pa.bool_(),
+}
+ITEM_FIELDS: dict[str, pa.DataType] = {
+    "item_category": pa.string(),
+    "item_subcategory": pa.string(),
+    "item_subjects": pa.list_(pa.string()),
+    "item_online_booking": pa.bool_(),
+    "item_params_text": pa.string(),
+}
+
+#: Префиксы колонок запроса — они идут первыми.
+QUERY_PREFIXES: tuple[str, ...] = ("query_id", "search_", "filter_")
 
 #: Имена файлов датасета (без расширения).
 DATASETS: tuple[str, ...] = (
@@ -86,9 +132,47 @@ def cast_decimals(table: pa.Table) -> pa.Table:
     return table
 
 
+def add_service_flag(table: pa.Table) -> pa.Table:
+    """Заменяет `item_category_id` булевым `item_is_service` на том же месте."""
+    if "item_category_id" not in table.column_names:
+        return table
+    idx = table.column_names.index("item_category_id")
+    is_service = pc.equal(table.column("item_category_id"), SERVICE_CATEGORY_ID)
+    return table.set_column(idx, SERVICE_FLAG, is_service.cast(pa.bool_()))
+
+
+def parse_params(table: pa.Table) -> pa.Table:
+    """Добавляет колонки из `infm_params_text` и убирает разобранные тексты."""
+    new: list[tuple[str, pa.Array]] = []
+    for column, fields, parse in (
+        ("search_infm_params_text", QUERY_FIELDS, ip.parse_search_filters),
+        ("item_infm_params_text", ITEM_FIELDS, ip.parse_item_params),
+    ):
+        if column not in table.column_names:
+            continue
+        parsed = [parse(text) for text in table.column(column).to_pylist()]
+        new += [(name, pa.array([row[name] for row in parsed], type=dtype))
+                for name, dtype in fields.items()]
+
+    present = [c for c in DROP_AFTER_PARSING if c in table.column_names]
+    table = table.drop_columns(present) if present else table
+    for name, values in new:
+        table = table.append_column(name, values)
+    return table
+
+
+def order_columns(table: pa.Table) -> pa.Table:
+    """Сначала поля запроса, затем поля объявления; внутри порядок сохраняется."""
+    query = [c for c in table.column_names if c.startswith(QUERY_PREFIXES)]
+    item = [c for c in table.column_names if c not in query]
+    return table.select(query + item)
+
+
 def transform(table: pa.Table) -> pa.Table:
     """Полный конвейер преобразований одного батча."""
-    return cast_decimals(drop_degenerate(table))
+    return order_columns(
+        parse_params(add_service_flag(cast_decimals(drop_degenerate(table))))
+    )
 
 
 # --- ввод/вывод --------------------------------------------------------------
@@ -97,13 +181,21 @@ def transform(table: pa.Table) -> pa.Table:
 def describe_changes(src: Path) -> dict[str, list[str]]:
     """Что именно изменится в файле — считается по схеме, без чтения данных."""
     schema = pq.ParquetFile(src).schema_arrow
+    added: list[str] = []
+    if "item_category_id" in schema.names:
+        added.append(f"{SERVICE_FLAG} (вместо item_category_id)")
+    if "search_infm_params_text" in schema.names:
+        added += list(QUERY_FIELDS)
+    if "item_infm_params_text" in schema.names:
+        added += list(ITEM_FIELDS)
     return {
-        "dropped": [c for c in DROP_COLUMNS if c in schema.names],
+        "dropped": [c for c in DROP_COLUMNS + DROP_AFTER_PARSING if c in schema.names],
         "casted": [
             c
             for c in DECIMAL_COLUMNS
             if c in schema.names and pa.types.is_decimal(schema.field(c).type)
         ],
+        "added": added,
     }
 
 
@@ -171,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{name}")
         print(f"  удалено колонок: {', '.join(changes['dropped']) or '—'}")
         print(f"  приведено к float64: {', '.join(changes['casted']) or '—'}")
+        print(f"  добавлено колонок: {', '.join(changes['added']) or '—'}")
 
         if args.dry_run:
             print(f"  строк: {pq.ParquetFile(src).metadata.num_rows:,}\n")
