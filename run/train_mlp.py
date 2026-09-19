@@ -1,0 +1,198 @@
+"""Обучение MLP-переранжировщика с lookup-эмбеддингами (src/mlp.py) и оценка.
+
+Те же данные и то же деление, что у LightGBM (run/train_reranker.py): обучение —
+train_features, ранняя остановка по recall@50 на val-tune, итог — val-test.
+Числовые признаки — как у модели `--features-from` (по умолчанию
+lgbm_no_item_stats). Дополнительно печатается ансамбль с этой LightGBM-моделью
+(среднее рангов внутри запроса).
+
+Пишет в models/<имя>/: model.pt, prep.json (нормировка и словари),
+per_event.parquet, recall.csv, config.json. Нужен torch_env и GPU.
+
+    python run/train_mlp.py
+    python run/train_mlp.py --epochs 20 --hidden 512 256 --name mlp_big
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import torch
+from data import load_catalog
+from features import CATEGORICAL
+from logs import log, step
+from mlp import EMBEDDINGS, Preprocessor, RerankMLP, Vocab, listwise_loss
+from paths import RERANK, RESULTS, ROOT
+from rerank import (drop_groups_without_positives, format_report, prepare_categorical, report,
+                    top_k_recall)
+
+CAT_KEYS = list(EMBEDDINGS)
+
+
+def load_part(part: str, data_dir: Path, numeric: list[str], items: pd.DataFrame) -> pd.DataFrame:
+    """Признаки части + сырые категории для эмбеддингов."""
+    cols = ["qid", "item_idx", "label", "it_microcat"] + numeric + (
+        ["val_part"] if part == "val" else [])
+    df = pd.read_parquet(data_dir / f"{part}_features.parquet", columns=cols)
+    events = pd.read_parquet(data_dir / f"{part}_events.parquet",
+                             columns=["qid", "search_location_id", "filter_category"]).set_index("qid")
+    idx = df.item_idx.to_numpy()
+    ev = events.loc[df.qid.to_numpy()]
+    df["microcat"] = df.pop("it_microcat")
+    df["category"] = items.item_category.fillna("").to_numpy()[idx]
+    df["item_loc"] = items.item_location_id.to_numpy()[idx]
+    df["query_loc"] = ev.search_location_id.to_numpy()
+    df["query_category"] = ev.filter_category.fillna("").to_numpy()
+    return df
+
+
+def tensors(df: pd.DataFrame, prep: Preprocessor, vocabs: dict[str, Vocab]):
+    num = torch.from_numpy(prep.transform(df))
+    cats = {k: torch.from_numpy(vocabs[k].encode(df[k].to_numpy())) for k in CAT_KEYS}
+    return num, cats
+
+
+@torch.no_grad()
+def predict(model, num, cats, batch: int = 200_000) -> np.ndarray:
+    model.eval()
+    out = []
+    for s in range(0, len(num), batch):
+        out.append(model(num[s:s + batch].cuda().float(),
+                         {k: v[s:s + batch].cuda().long() for k, v in cats.items()}).float().cpu())
+    return torch.cat(out).numpy()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--data-dir", type=Path, default=RERANK)
+    parser.add_argument("--features-from", default="lgbm_no_item_stats",
+                        help="модель в models/, чей список признаков брать (и с кем ансамбль)")
+    parser.add_argument("--baseline", default="retrievers_regions")
+    parser.add_argument("--hidden", type=int, nargs="+", default=[256, 128])
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--groups-per-batch", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--top-k", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--name", default="mlp")
+    args = parser.parse_args(argv)
+    t_start = time.time()
+    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+    log(f"MLP-переранжировщик: {args.name}")
+
+    lgb_dir = ROOT / "models" / args.features_from
+    lgb_config = json.loads((lgb_dir / "config.json").read_text(encoding="utf-8"))
+    numeric = [f for f in lgb_config["features"] if f not in CATEGORICAL]
+
+    with step("читаем признаки и категории"):
+        items = load_catalog(["item_category", "item_location_id"])
+        train = drop_groups_without_positives(load_part("train", args.data_dir, numeric, items))
+        train = train.sort_values("qid", kind="stable").reset_index(drop=True)
+        val = load_part("val", args.data_dir, numeric, items)
+        val_events = pd.read_parquet(args.data_dir / "val_events.parquet").set_index("qid")
+    print(f"  обучение: {train.qid.nunique():,} событий, {len(train):,} пар; "
+          f"числовых признаков: {len(numeric)}; эмбеддинги: {', '.join(CAT_KEYS)}")
+
+    with step("нормировка и словари категорий (по обучению)"):
+        prep = Preprocessor(numeric).fit(train)
+        vocabs = {k: Vocab(train[k].to_numpy()) for k in CAT_KEYS}
+        num_tr, cats_tr = tensors(train, prep, vocabs)
+        num_va, cats_va = tensors(val, prep, vocabs)
+        labels_tr = torch.from_numpy(train.label.to_numpy(dtype=np.float32))
+        # группы: индексы строк каждого события, дополненные до одной длины
+        starts = np.flatnonzero(np.r_[True, train.qid.to_numpy()[1:] != train.qid.to_numpy()[:-1]])
+        sizes = np.diff(np.r_[starts, len(train)])
+        max_size = int(sizes.max())
+        pad = np.full((len(starts), max_size), -1, dtype=np.int64)
+        for i, (s, n) in enumerate(zip(starts, sizes)):
+            pad[i, :n] = np.arange(s, s + n)
+        del train
+        gc.collect()
+    print(f"  вход сети: {prep.n_out} числовых + эмбеддинги; групп {len(pad):,}, до {max_size} кандидатов")
+    print("  размеры словарей: " + ", ".join(f"{k} {len(v):,}" for k, v in vocabs.items()))
+
+    model = RerankMLP(prep.n_out, {k: len(v) for k, v in vocabs.items()}, args.hidden,
+                      args.dropout).cuda()
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    tune_mask = (val.val_part == "tune").to_numpy()
+    tune_df = val[tune_mask]
+    best, best_state, bad_epochs = -1.0, None, 0
+
+    for epoch in range(1, args.epochs + 1):
+        with step(f"эпоха {epoch}/{args.epochs}"):
+            model.train()
+            order = rng.permutation(len(pad))
+            losses = []
+            for b in range(0, len(order), args.groups_per_batch):
+                rows = torch.from_numpy(pad[order[b:b + args.groups_per_batch]])
+                mask = rows >= 0
+                flat = rows.clamp(min=0).reshape(-1)
+                scores = model(num_tr[flat].cuda().float(),
+                               {k: v[flat].cuda().long() for k, v in cats_tr.items()})
+                loss = listwise_loss(scores.view(rows.shape), labels_tr[flat].cuda().view(rows.shape),
+                                     mask.cuda())
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                losses.append(loss.item())
+            tune_score = predict(model, num_va[tune_mask], {k: v[tune_mask] for k, v in cats_va.items()})
+            tune_recall = top_k_recall(tune_df, tune_score, val_events.n_pos[
+                val_events.val_part == "tune"], args.top_k).mean()
+        print(f"  loss {np.mean(losses):.4f} | recall@{args.top_k} val-tune {tune_recall:.2%}")
+        if tune_recall > best:
+            best, bad_epochs = tune_recall, 0
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        else:
+            bad_epochs += 1
+            if bad_epochs >= args.patience:
+                log(f"ранняя остановка: {args.patience} эпохи без улучшения")
+                break
+    model.load_state_dict(best_state)
+
+    with step("оценка на валидации (MLP, LightGBM, ансамбль)"):
+        s_mlp = predict(model, num_va, cats_va)
+        lgb_model = lgb.Booster(model_str=(lgb_dir / "model.txt").read_text(encoding="utf-8"))
+        s_lgb = lgb_model.predict(prepare_categorical(
+            pd.read_parquet(args.data_dir / "val_features.parquet",
+                            columns=lgb_config["features"])))
+        rank = lambda s: pd.Series(s).groupby(val.qid.to_numpy()).rank(pct=True).to_numpy()
+        s_ens = rank(s_mlp) + rank(s_lgb)
+        base = pd.read_parquet(RESULTS / args.baseline / "per_event.parquet")[
+            "RRF | гео + добивка"].reindex(val_events.index)
+        table, per_event = report(val, {"MLP": s_mlp, "LightGBM": s_lgb, "ансамбль": s_ens},
+                                  val_events, base, args.top_k)
+    print(f"\nrecall@{args.top_k}")
+    print(format_report(table))
+
+    out = ROOT / "models" / args.name
+    with step(f"сохраняем модель и отчёт в {out}"):
+        out.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), out / "model.pt")
+        (out / "prep.json").write_text(json.dumps(
+            {"prep": prep.to_json(), "vocabs": {k: v.to_json() for k, v in vocabs.items()}},
+            ensure_ascii=False), encoding="utf-8")
+        per_event.to_parquet(out / "per_event.parquet")
+        table.to_csv(out / "recall.csv", encoding="utf-8-sig")
+        (out / "config.json").write_text(json.dumps(
+            {"type": "mlp", **{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+             "numeric": numeric, "best_tune_recall": best}, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+    log(f"готово за {(time.time() - t_start) / 60:.1f} мин")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

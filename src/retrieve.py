@@ -36,13 +36,13 @@ FUSED = "RRF"
 
 def build_queries(df: pd.DataFrame, pools: CandidatePools, id_col: str,
                   extra: tuple[str, ...] = ()) -> pd.DataFrame:
-    """Запросы для поиска: текст, комбинация фильтров и код города, индекс — `id_col`.
+    """Запросы для поиска: текст, комбинация фильтров и гео, индекс — `id_col`.
 
     Строки с одинаковым `id_col` схлопываются (первая), `extra` — дополнительные колонки.
     """
-    df = df.assign(fkey=filter_key(df), loc_code=pools.location_codes(df.search_location_id))
+    df = df.assign(fkey=filter_key(df), geo=pools.geo_codes(df.search_location_id))
     agg = {"query": ("search_query", "first"), "fkey": ("fkey", "first"),
-           "loc_code": ("loc_code", "first"), **{c: (c, "first") for c in extra}}
+           "geo": ("geo", "first"), **{c: (c, "first") for c in extra}}
     return df.groupby(id_col, sort=False).agg(**agg)
 
 
@@ -106,8 +106,8 @@ def search(queries: pd.DataFrame, pools: CandidatePools, retrievers: list, top_k
                 group = queries.loc[ids_of_text[text]]
                 for v in variants:
                     done = {}     # запросы с одним текстом и одним пулом делят результат
-                    for qid, fkey, loc in zip(group.index, group.fkey, group.loc_code):
-                        key = pools.key(v, fkey, loc)
+                    for qid, fkey, geo in zip(group.index, group.fkey, group.geo):
+                        key = pools.key(v, fkey, geo)
                         if key not in done:
                             pool = pools.indices(key)
                             ranks = [ranking(s[i], pool, rrf_depth) for s in scores]

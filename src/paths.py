@@ -8,4 +8,5 @@ DATASET = ROOT / "dataset"              # сырые parquet-файлы
 PROCESSED = DATASET / "processed"       # результат run/preprocess.py
 SPLIT = DATASET / "split"               # результат run/make_split.py
 EMBEDDINGS = DATASET / "embeddings"     # кэш эмбеддингов каталога (run/encode_catalog.py)
+RERANK = DATASET / "rerank"             # кандидаты и признаки переранжировщика
 RESULTS = ROOT / "results"              # таблицы метрик

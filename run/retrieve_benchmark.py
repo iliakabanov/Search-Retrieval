@@ -5,7 +5,12 @@ benchmark_queries — тем же алгоритмом, что оценивае�
 Алгоритм (src/retrieve.py): отсечение кандидатов по варианту `--variant`,
 ранжирование каждым ретривером (BM25, e5-large, RoSBERTa) и слияние RRF. По
 умолчанию — лучшая конфигурация на валидации: RRF всех трёх ретриверов внутри
-города запроса («только гео», recall@50 78.1% на валидации).
+гео запроса («только гео») с добивкой.
+
+**Гео региона.** У 17% запросов бенчмарка вместо города регион — локация, где
+не бывает объявлений. Их гео — локации, где в train лежат позитивы запросов из
+этого региона, покрывающие долю `--region-cover` (0.95, подобрано на валидации;
+см. src/geo.py). Без этого пул «только гео» у них пустой.
 
 **Добивка до 50.** При отсечении по городу у части запросов кандидатов меньше 50
 (город, где мало объявлений, или ни одного). Метрика — Recall@50, порядок в
@@ -50,7 +55,8 @@ import pandas as pd
 from answer import check_answer, make_answer, save_answer
 from bm25 import BM25
 from data import (FILTER_ITEM_COLUMNS, TEXT_ITEM_COLUMNS, load_benchmark_items,
-                  load_benchmark_queries)
+                  load_benchmark_queries, load_geo_pairs)
+from geo import region_map
 from logs import log, step
 from paths import RESULTS
 from pools import VARIANTS, CandidatePools
@@ -69,6 +75,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fill", default="только фильтры", choices=VARIANTS,
                         help="чем добивать ответ до --top-k (по умолчанию: только фильтры)")
     parser.add_argument("--no-fill", action="store_true", help="не добивать ответ до --top-k")
+    parser.add_argument("--region-cover", type=float, default=0.95,
+                        help="гео региона: его локации, покрывающие эту долю позитивов "
+                             "в train (0 — пул региона пустой)")
     parser.add_argument("--no-rrf", action="store_true",
                         help="не сливать ретриверы; итоговый — первый из --retrievers")
     parser.add_argument("--top-k", type=int, default=50)
@@ -99,12 +108,19 @@ def main(argv: list[str] | None = None) -> int:
         docs = doc_texts(items)
         items = items.drop(columns=TEXT_ITEM_COLUMNS)   # тексты уже в docs
         gc.collect()
+    with step(f"строим гео регионов по train (покрытие {args.region_cover:.0%})"):
+        geo_pairs = load_geo_pairs(train_pairs_only=False)
+        regions = region_map(geo_pairs, set(geo_pairs.item_location_id), args.region_cover)
     with step("готовим запросы и маски фильтров"):
-        pools = CandidatePools(items)
+        pools = CandidatePools(items, regions)
         queries = build_queries(queries_raw, pools, "query_id")
+    is_region = queries_raw.search_location_id.isin(regions).to_numpy()
+    n_geo = queries.geo.map(len)
     print(f"  корпус: {len(items):,} объявлений | запросов: {len(queries):,} | "
-          f"уникальных текстов: {queries['query'].nunique():,} | "
-          f"город запроса отсутствует в корпусе: {(queries.loc_code < 0).sum():,}")
+          f"уникальных текстов: {queries['query'].nunique():,}")
+    print(f"  гео: город — {int((~is_region).sum()):,} запросов, регион — {int(is_region.sum()):,} "
+          f"(локаций у региона, медиана {n_geo[is_region].median():.0f}); "
+          f"без гео в корпусе: {int((n_geo == 0).sum()):,}")
 
     # ретриверы
     retrievers = []

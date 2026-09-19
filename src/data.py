@@ -30,6 +30,28 @@ def load_catalog(columns: list[str]) -> pd.DataFrame:
             .drop_duplicates("item_id").set_index("item_id").loc[catalog_ids].reset_index())
 
 
+def load_item_locations() -> pd.Series:
+    """Локация каждого объявления train: item_id -> item_location_id."""
+    df = pq.read_table(PROCESSED / "train.parquet",
+                       columns=["item_id", "item_location_id"]).to_pandas()
+    return df.drop_duplicates("item_id").set_index("item_id").item_location_id
+
+
+def load_geo_pairs(train_pairs_only: bool) -> pd.DataFrame:
+    """Пары (search_location_id, item_location_id) для geo.region_map.
+
+    Для валидации — только обучающая часть разбиения (`train_pairs`), чтобы не было
+    утечки; для бенчмарка — весь обработанный train.
+    """
+    if train_pairs_only:
+        pairs = pq.read_table(SPLIT / "train_pairs.parquet",
+                              columns=["search_location_id", "item_id"]).to_pandas()
+        pairs["item_location_id"] = pairs.item_id.map(load_item_locations())
+        return pairs[["search_location_id", "item_location_id"]]
+    return pq.read_table(PROCESSED / "train.parquet",
+                         columns=["search_location_id", "item_location_id"]).to_pandas()
+
+
 def load_val_eval() -> pd.DataFrame:
     """Позитивы событий валидации, готовых к оценке."""
     return pq.read_table(SPLIT / "val_eval.parquet").to_pandas()

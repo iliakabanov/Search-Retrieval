@@ -80,3 +80,14 @@ class BM25:
     def scores(self, rows: slice) -> np.ndarray:
         """Скоры запросов `texts[rows]` по всему каталогу: (n_запросов, n_документов)."""
         return (self.query_matrix(self._texts[rows]) @ self._weights_t).toarray()
+
+    def pair_scores(self, query_rows: np.ndarray, items: np.ndarray,
+                    batch: int = 200_000) -> np.ndarray:
+        """Скоры отдельных пар: запрос `texts[query_rows[i]]` — документ `items[i]`."""
+        q = self.query_matrix(self._texts)
+        docs = self._weights_t.T.tocsr()
+        out = np.empty(len(items), dtype=np.float32)
+        for s in range(0, len(items), batch):
+            e = s + batch
+            out[s:e] = np.asarray(q[query_rows[s:e]].multiply(docs[items[s:e]]).sum(axis=1)).ravel()
+        return out

@@ -26,6 +26,10 @@
 запроса и объявления не совпадают. Поэтому гео как жёсткое отсечение ограничивает
 recall сверху; его разумнее отдавать ранжированию как признак.
 
+Гео запроса — набор локаций каталога: у города — он сам, у региона (локации,
+где не бывает объявлений) — локации его позитивов в train (`geo.region_map`).
+Без соответствия пул «только гео» у региона пустой.
+
 Для потолка и случайного порядка сами пулы не нужны — только их размеры
 (`stats`). Индексы кандидатов (`indices`) строятся лениво при оценке и
 кэшируются: пул зависит от комбинации фильтров и города, а таких комбинаций куда
@@ -56,8 +60,10 @@ def filter_key(df: pd.DataFrame) -> list[tuple]:
 class CandidatePools:
     """Пулы кандидатов по каталогу `items` (атрибуты из `data.FILTER_ITEM_COLUMNS`)."""
 
-    def __init__(self, items: pd.DataFrame):
+    def __init__(self, items: pd.DataFrame, region_map: dict[int, list[int]] | None = None):
+        """`region_map` — {регион: локации объявлений} для запросов с регионом (geo.py)."""
         self.n_items = len(items)
+        self.region_map = region_map or {}
         self._category = items.item_category.fillna("").to_numpy()
         self._subcategory = items.item_subcategory.fillna("").to_numpy()
         self._subjects = items.item_subjects.map(tuple).to_numpy()
@@ -69,9 +75,22 @@ class CandidatePools:
         self._both_size: dict[tuple, np.ndarray] = {}
         self._cache: dict[tuple, np.ndarray | None] = {}
 
-    def location_codes(self, location_ids: pd.Series) -> np.ndarray:
-        """Код города каталога; -1, если в каталоге нет объявлений из этого города."""
-        return location_ids.map(self._loc_index).fillna(-1).astype(int).to_numpy()
+    def geo_codes(self, location_ids: pd.Series) -> list[tuple[int, ...]]:
+        """Гео запроса — коды локаций каталога: у города — он сам, у региона — его
+        локации из region_map; пусто, если в каталоге нет ни одной."""
+        cache: dict[int, tuple[int, ...]] = {}
+        for loc in location_ids.unique():
+            if loc in self._loc_index.index:
+                cache[loc] = (int(self._loc_index[loc]),)
+            else:
+                cache[loc] = tuple(sorted(int(self._loc_index[x])
+                                          for x in self.region_map.get(loc, ())
+                                          if x in self._loc_index.index))
+        return [cache[loc] for loc in location_ids]
+
+    def in_geo(self, idx: np.ndarray, geo: tuple[int, ...]) -> np.ndarray:
+        codes = self.loc_code[idx] if idx is not None else self.loc_code
+        return codes == geo[0] if len(geo) == 1 else np.isin(codes, geo)
 
     def mask(self, fkey: tuple) -> np.ndarray:
         if fkey not in self.masks:
@@ -89,10 +108,10 @@ class CandidatePools:
         return self.masks[fkey]
 
     @staticmethod
-    def key(variant: str, fkey: tuple, loc: int) -> tuple:
+    def key(variant: str, fkey: tuple, geo: tuple[int, ...]) -> tuple:
         """События с одинаковым ключом делят один пул."""
         return {"без отсечения": (variant,), "только фильтры": (variant, fkey),
-                "только гео": (variant, loc), "фильтры + гео": (variant, fkey, loc)}[variant]
+                "только гео": (variant, geo), "фильтры + гео": (variant, fkey, geo)}[variant]
 
     def indices(self, key: tuple) -> np.ndarray | None:
         """Индексы кандидатов в каталоге; None — весь каталог."""
@@ -103,26 +122,28 @@ class CandidatePools:
             elif variant == "только фильтры":
                 pool = np.flatnonzero(self.mask(rest[0]))
             elif variant == "только гео":
-                pool = np.flatnonzero(self.loc_code == rest[0])
+                pool = np.flatnonzero(self.in_geo(None, rest[0]))
             else:
-                pool = np.flatnonzero(self.mask(rest[0]) & (self.loc_code == rest[1]))
+                pool = np.flatnonzero(self.mask(rest[0]) & self.in_geo(None, rest[1]))
             self._cache[key] = pool
         return self._cache[key]
 
-    def stats(self, fkey: tuple, loc: int, gold: np.ndarray) -> dict[str, tuple[int, int]]:
+    def stats(self, fkey: tuple, geo: tuple[int, ...], gold: np.ndarray
+              ) -> dict[str, tuple[int, int]]:
         """{вариант: (позитивов пережило отсечение, размер пула)} для одного события."""
         m = self.mask(fkey)
         if fkey not in self._both_size:
             self._both_size[fkey] = np.bincount(self.loc_code[m],
                                                 minlength=len(self._loc_values))
         in_filters = m[gold]
-        in_geo = self.loc_code[gold] == loc     # loc = -1 не совпадёт ни с чем
+        in_geo = self.in_geo(gold, geo) if geo else np.zeros(len(gold), dtype=bool)
+        geo = list(geo)
         return {
             "без отсечения": (len(gold), self.n_items),
             "только фильтры": (int(in_filters.sum()), int(m.sum())),
-            "только гео": (int(in_geo.sum()), int(self._geo_size[loc]) if loc >= 0 else 0),
+            "только гео": (int(in_geo.sum()), int(self._geo_size[geo].sum())),
             "фильтры + гео": (int((in_filters & in_geo).sum()),
-                              int(self._both_size[fkey][loc]) if loc >= 0 else 0),
+                              int(self._both_size[fkey][geo].sum())),
             # кандидаты добивки — из пулов гео и фильтров; размер пула не определён
             FILLED: (int((in_filters | in_geo).sum()), -1),
         }
@@ -134,9 +155,9 @@ def cutoff_stats(events: pd.DataFrame, pools: CandidatePools, top_k: int) -> pd.
     Колонки — MultiIndex (вариант, величина), величины: `passed`, `pool`, `random_hits`.
     """
     rows = []
-    for fkey, loc, gold in zip(events.fkey, events.loc_code, events.positives):
+    for fkey, geo, gold in zip(events.fkey, events.geo, events.positives):
         gold = np.fromiter(gold, dtype=np.int64)
-        rows.append({(v, q): x for v, (n_pass, n_cand) in pools.stats(fkey, loc, gold).items()
+        rows.append({(v, q): x for v, (n_pass, n_cand) in pools.stats(fkey, geo, gold).items()
                      for q, x in (("passed", n_pass), ("pool", n_cand))})
     out = pd.DataFrame(rows, index=events.index)
     out.columns = pd.MultiIndex.from_tuples(out.columns)

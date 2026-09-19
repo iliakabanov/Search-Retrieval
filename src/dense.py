@@ -138,3 +138,15 @@ class DenseRetriever:
 
     def scores(self, rows: slice) -> np.ndarray:
         return (self._query_emb[rows] @ self._doc_emb.T).float().cpu().numpy()
+
+    def pair_scores(self, query_rows: np.ndarray, items: np.ndarray,
+                    batch: int = 100_000) -> np.ndarray:
+        """Косинус отдельных пар: запрос `texts[query_rows[i]]` — документ `items[i]`."""
+        import torch
+
+        out = np.empty(len(items), dtype=np.float32)
+        for s in range(0, len(items), batch):
+            q = self._query_emb[torch.from_numpy(query_rows[s:s + batch]).cuda()]
+            d = self._doc_emb[torch.from_numpy(items[s:s + batch]).cuda()]
+            out[s:s + batch] = (q * d).sum(dim=1).float().cpu().numpy()
+        return out

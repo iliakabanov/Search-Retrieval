@@ -125,6 +125,15 @@ def slice_table(recall: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
         list(REPORT_VARIANTS), level=0)
 
 
+def group_table(recall: pd.DataFrame, groups: pd.Series, variants: list[str]) -> pd.DataFrame:
+    """Recall по группам событий: строки — ретриверы, столбцы — (группа, вариант)."""
+    names = [n for n in recall.columns.get_level_values(0).unique() if n != "случайный порядок"]
+    table = recall[names].groupby(groups).mean().T.unstack("вариант")
+    table = table.loc[names, [(g, v) for g in sorted(groups.dropna().unique()) for v in variants]]
+    table.columns.names = [groups.name, "вариант"]
+    return table
+
+
 def complementarity(recall: pd.DataFrame, names: list[str], variant: str) -> pd.DataFrame:
     """Доля событий: нашёл ретривер в строке и не нашёл ретривер в столбце."""
     found = {n: recall[(n, variant)] > 0 for n in names}
