@@ -27,6 +27,7 @@ from bm25 import BM25
 from data import (FILTER_ITEM_COLUMNS, TEXT_ITEM_COLUMNS, load_benchmark_items, load_catalog)
 from features import (TrainStats, filter_features, haversine_km, item_features,
                       location_centroids, score_gaps)
+from geo import neighbor_map
 from logs import log, step
 from paths import PROCESSED, RERANK, SPLIT
 from texts import doc_texts
@@ -88,6 +89,9 @@ def build_part(part: str, args) -> None:
             pd.concat([train_items.item_latitude, items.item_latitude]),
             pd.concat([train_items.item_longitude, items.item_longitude]))
         del train_items
+        neighbors = neighbor_map(centroids, args.nb_radius)
+        nb_pairs = pd.MultiIndex.from_tuples(
+            [(q, i) for q, near in neighbors.items() for i in near])
 
     item_ids = items.item_id.to_numpy()
     item_loc = items.item_location_id.to_numpy()
@@ -121,13 +125,16 @@ def build_part(part: str, args) -> None:
                 f[f"sc_{name}"] = retrievers[name].pair_scores(qrow, idx)
             f = pd.concat([f, score_gaps(f, ["sc_bm25"] + [f"sc_{n}" for n in DENSE])], axis=1)
             f["sc_cand_rank"] = c.cand_rank.to_numpy()
-            f["sc_source_quota"] = c.source.to_numpy()
+            f["sc_source_quota"] = (c.source.to_numpy() == 1).astype(np.int8)
+            f["sc_source_nb"] = (c.source.to_numpy() == 2).astype(np.int8)
             for col in [x for x in c.columns if x.startswith("rank_")]:
                 f[f"sc_{col}"] = c[col].to_numpy()
 
             # гео
             sloc = ev.search_location_id.to_numpy()
             f["geo_same_loc"] = (item_loc[idx] == sloc).astype(np.int8)
+            f["geo_is_neighbor"] = pd.MultiIndex.from_arrays([sloc, item_loc[idx]]).isin(
+                nb_pairs).astype(np.int8)
             cen = centroids.reindex(sloc)
             f["geo_dist_km"] = haversine_km(cen.lat.to_numpy(), cen.lon.to_numpy(),
                                             item_lat[idx], item_lon[idx]).astype(np.float32)
@@ -159,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--parts", nargs="+", default=["train", "val"],
                         choices=["train", "val", "benchmark"])
+    parser.add_argument("--nb-radius", type=float, default=50.0,
+                        help="радиус соседних локаций, км (как в build_candidates)")
     parser.add_argument("--out-dir", type=Path, default=RERANK,
                         help=f"где кандидаты и куда писать признаки (по умолчанию: {RERANK})")
     args = parser.parse_args(argv)

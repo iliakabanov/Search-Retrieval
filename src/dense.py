@@ -25,8 +25,9 @@ import numpy as np
 
 from paths import EMBEDDINGS
 
-#: Корпуса: каталог валидации (dataset/split) и корпус бенчмарка (benchmark_items).
-CATALOG, BENCHMARK = "catalog", "benchmark"
+#: Корпуса: каталог валидации (dataset/split), корпус бенчмарка (benchmark_items) и
+#: объявления train вне каталога (для обучения на всём train; data.load_train_extra_items).
+CATALOG, BENCHMARK, TRAIN_EXTRA = "catalog", "benchmark", "train_extra"
 
 PART_SIZE = 16_384
 PROGRESS_STEP = 2_048  # шаг прогресс-бара при кодировании каталога

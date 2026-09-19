@@ -29,7 +29,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 from logs import step
-from pools import VARIANTS, CandidatePools, filter_key
+from pools import NEIGHBORS, VARIANTS, CandidatePools, filter_key
 
 FUSED = "RRF"
 
@@ -40,9 +40,10 @@ def build_queries(df: pd.DataFrame, pools: CandidatePools, id_col: str,
 
     Строки с одинаковым `id_col` схлопываются (первая), `extra` — дополнительные колонки.
     """
-    df = df.assign(fkey=filter_key(df), geo=pools.geo_codes(df.search_location_id))
+    df = df.assign(fkey=filter_key(df), geo=pools.geo_codes(df.search_location_id),
+                   nb=pools.neighbor_codes(df.search_location_id))
     agg = {"query": ("search_query", "first"), "fkey": ("fkey", "first"),
-           "geo": ("geo", "first"), **{c: (c, "first") for c in extra}}
+           "geo": ("geo", "first"), "nb": ("nb", "first"), **{c: (c, "first") for c in extra}}
     return df.groupby(id_col, sort=False).agg(**agg)
 
 
@@ -106,7 +107,8 @@ def search(queries: pd.DataFrame, pools: CandidatePools, retrievers: list, top_k
                 group = queries.loc[ids_of_text[text]]
                 for v in variants:
                     done = {}     # запросы с одним текстом и одним пулом делят результат
-                    for qid, fkey, geo in zip(group.index, group.fkey, group.geo):
+                    geos = group.nb if v == NEIGHBORS else group.geo
+                    for qid, fkey, geo in zip(group.index, group.fkey, geos):
                         key = pools.key(v, fkey, geo)
                         if key not in done:
                             pool = pools.indices(key)

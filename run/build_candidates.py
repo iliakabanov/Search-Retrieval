@@ -1,5 +1,11 @@
 """Кандидаты для переранжировщика (src/candidates.py, docs/reranker_plan.md).
 
+Места в списке: `--k-geo` из гео запроса (город или локации региона), `--k-nb`
+из соседних локаций города (центры не дальше `--nb-radius` км), остальные — вне
+гео по фильтрам. По умолчанию 330 / 85 / 85 при K = 500, RRF сливает по 500
+лучших от каждого ретривера. Потолок кандидатов на валидации — 97.6% (было 95.1%
+при K = 300 без соседей и глубине RRF 300).
+
 Части:
 
 * `train` — события train_pairs с позитивом в каталоге (~173 тыс.). Делятся на
@@ -36,13 +42,14 @@ from data import (FILTER_ITEM_COLUMNS, TEXT_ITEM_COLUMNS, load_benchmark_items,
                   load_benchmark_queries, load_catalog, load_geo_pairs, load_item_locations,
                   load_val_eval)
 from evaluate import build_events
-from geo import region_map
+from geo import corpus_centroids, neighbor_map, region_map
 from logs import log, step
 from paths import RERANK, SPLIT
 from pools import CandidatePools
 from retrieve import build_queries
 from texts import doc_texts
 
+GEO_COLUMNS = ["item_latitude", "item_longitude"]
 EVENT_META = ["search_query", "search_location_id", "filter_category", "filter_subcategory",
               "filter_subject", "filter_online_booking"]
 
@@ -99,7 +106,7 @@ def run_val(items, docs, retrievers, args) -> None:
         val = val[val.event_id.isin(set(keep))]
     with step("гео регионов по train_pairs"):
         regions = region_map(load_geo_pairs(True), set(load_item_locations()), args.region_cover)
-    pools = CandidatePools(items, regions)
+    pools = CandidatePools(items, regions, args.neighbors)
     events = build_events(val, pools, items.item_id)
     meta = val.groupby("event_id")[EVENT_META].first().reindex(events.index)
     events = events.join(meta.drop(columns="search_query"))
@@ -109,8 +116,8 @@ def run_val(items, docs, retrievers, args) -> None:
           f"test {int((events.val_part == 'test').sum()):,})")
 
     out = Writer(args.out_dir / "val_candidates.parquet")
-    for df in generate(events, pools, retrievers, args.k, args.quota,
-                       gold=events.positives.to_dict()):
+    for df in generate(events, pools, retrievers, args.k, args.quota, args.nb_quota,
+                       gold=events.positives.to_dict(), rrf_depth=args.rrf_depth):
         out.write(df)
     out.close()
     save_events(events, "val", args.out_dir)
@@ -141,16 +148,16 @@ def run_train(items, docs, retrievers, args) -> None:
         with step("гео регионов по остальным фолдам"):
             regions = region_map(geo_pairs_all[geo_pairs_all.fold != fold],
                                  item_locs, args.region_cover)
-        pools = CandidatePools(items, regions)
+        pools = CandidatePools(items, regions, args.neighbors)
         fold_pairs = pairs[pairs.fold == fold]
         events = build_events(fold_pairs, pools, items.item_id)
         meta = fold_pairs.groupby("event_id")[EVENT_META].first().reindex(events.index)
         events = events.join(meta.drop(columns="search_query"))
         events["is_region"] = events.search_location_id.isin(regions)
         events["fold"] = fold
-        for df in generate(events, pools, retrievers, args.k, args.quota,
+        for df in generate(events, pools, retrievers, args.k, args.quota, args.nb_quota,
                            gold=events.positives.to_dict(), neg_top=args.neg_top,
-                           neg_random=args.neg_random, seed=fold):
+                           neg_random=args.neg_random, seed=fold, rrf_depth=args.rrf_depth):
             out.write(df)
         all_events.append(events)
         gc.collect()
@@ -164,7 +171,7 @@ def run_benchmark(args) -> None:
     from dense import BENCHMARK
     with step("читаем корпус бенчмарка и тексты"):
         queries_raw = load_benchmark_queries()
-        items = load_benchmark_items(TEXT_ITEM_COLUMNS + FILTER_ITEM_COLUMNS)
+        items = load_benchmark_items(TEXT_ITEM_COLUMNS + FILTER_ITEM_COLUMNS + GEO_COLUMNS)
         docs = doc_texts(items)
         items = items.drop(columns=TEXT_ITEM_COLUMNS)
     retrievers = build_retrievers(items, docs, BENCHMARK)
@@ -173,14 +180,15 @@ def run_benchmark(args) -> None:
     with step("гео регионов по всему train"):
         geo_pairs = load_geo_pairs(False)
         regions = region_map(geo_pairs, set(geo_pairs.item_location_id), args.region_cover)
-    pools = CandidatePools(items, regions)
+    args.neighbors = neighbor_map(corpus_centroids(items), args.nb_radius)
+    pools = CandidatePools(items, regions, args.neighbors)
     queries = build_queries(queries_raw, pools, "query_id")
     meta = queries_raw.set_index("query_id")[EVENT_META].reindex(queries.index)
     queries = queries.join(meta.drop(columns="search_query"))
     queries["is_region"] = queries.search_location_id.isin(regions)
 
     out = Writer(args.out_dir / "benchmark_candidates.parquet")
-    for df in generate(queries, pools, retrievers, args.k, args.quota):
+    for df in generate(queries, pools, retrievers, args.k, args.quota, args.nb_quota, rrf_depth=args.rrf_depth):
         out.write(df)
     out.close()
     save_events(queries, "benchmark", args.out_dir)
@@ -199,8 +207,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--parts", nargs="+", default=["train", "val"],
                         choices=["train", "val", "benchmark"])
-    parser.add_argument("--k", type=int, default=300, help="кандидатов на запрос")
-    parser.add_argument("--quota", type=float, default=0.2, help="доля мест вне гео")
+    parser.add_argument("--k", type=int, default=500, help="кандидатов на запрос")
+    parser.add_argument("--k-geo", type=int, default=330, help="мест из гео запроса")
+    parser.add_argument("--k-nb", type=int, default=85,
+                        help="мест из соседних локаций города (0 — без соседей)")
+    parser.add_argument("--nb-radius", type=float, default=50.0, help="радиус соседей, км")
+    parser.add_argument("--rrf-depth", type=int, default=500,
+                        help="сколько лучших от каждого ретривера сливает RRF")
     parser.add_argument("--region-cover", type=float, default=0.95)
     parser.add_argument("--folds", type=int, default=5, help="фолдов обучающих событий")
     parser.add_argument("--neg-top", type=int, default=50, help="обучение: самых высоких негативов")
@@ -209,21 +222,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-val-events", type=int, default=0, help="0 — все (для проверок)")
     parser.add_argument("--out-dir", type=Path, default=RERANK, help=f"по умолчанию: {RERANK}")
     args = parser.parse_args(argv)
+    args.nb_quota = args.k_nb / args.k
+    args.quota = (args.k - args.k_geo - args.k_nb) / args.k
 
     t_start = time.time()
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    log(f"кандидаты для переранжировщика: части {', '.join(args.parts)}, K={args.k}, "
-        f"квота вне гео {args.quota:.0%}")
+    log(f"кандидаты для переранжировщика: части {', '.join(args.parts)}, K={args.k}: "
+        f"гео {args.k_geo}, соседи до {args.nb_radius:g} км {args.k_nb}, "
+        f"вне гео {args.k - args.k_geo - args.k_nb}")
 
     catalog_parts = [p for p in args.parts if p in ("train", "val")]
     if catalog_parts:
         from dense import CATALOG
         with step("читаем каталог и тексты"):
-            items = load_catalog(TEXT_ITEM_COLUMNS + FILTER_ITEM_COLUMNS)
+            items = load_catalog(TEXT_ITEM_COLUMNS + FILTER_ITEM_COLUMNS + GEO_COLUMNS)
             docs = doc_texts(items)
             items = items.drop(columns=TEXT_ITEM_COLUMNS)
         retrievers = build_retrievers(items, docs, CATALOG)
         del docs
+        with step(f"соседние локации в радиусе {args.nb_radius:g} км"):
+            args.neighbors = neighbor_map(corpus_centroids(items), args.nb_radius)
+        print(f"  городов с соседями: {len(args.neighbors):,}")
         gc.collect()
         for part in catalog_parts:
             log(f"часть {part}")

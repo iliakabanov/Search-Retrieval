@@ -9,6 +9,10 @@ predictions.parquet (query_id, rank, item_id, score), config.json. Печата�
 насколько ответ совпадает с прошлым (RRF), — для контроля.
 
     python run/rerank_benchmark.py --model lgbm_no_item_stats
+    python run/rerank_benchmark.py --model lgbm_nb --mlp mlp_nb     # ансамбль LightGBM + MLP
+
+С `--mlp` скор — сумма рангов (в долях) LightGBM и MLP внутри запроса, как в
+ансамбле на валидации (run/train_mlp.py); `--mlp-only` — только MLP.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
@@ -30,16 +35,40 @@ from paths import RERANK, RESULTS, ROOT
 from rerank import prepare_categorical
 
 
+def mlp_scores(name: str, data_dir: Path) -> np.ndarray:
+    """Скоры MLP для строк benchmark_features (в их порядке)."""
+    import torch
+    from mlp import Preprocessor, RerankMLP, Vocab
+    from train_mlp import load_part, predict, tensors
+
+    folder = ROOT / "models" / name
+    config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    saved = json.loads((folder / "prep.json").read_text(encoding="utf-8"))
+    prep = Preprocessor.from_json(saved["prep"])
+    vocabs = {k: Vocab(np.array(v, dtype=object) if v and isinstance(v[0], str) else np.array(v))
+              for k, v in saved["vocabs"].items()}
+    items = load_benchmark_items(["item_category", "item_location_id"])
+    df = load_part("benchmark", data_dir, config["numeric"], items)
+    model = RerankMLP(prep.n_out, {k: len(v) for k, v in vocabs.items()}, config["hidden"],
+                      config["dropout"]).cuda()
+    model.load_state_dict(torch.load(folder / "model.pt"))
+    num, cats = tensors(df, prep, vocabs)
+    return predict(model, num, cats)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", required=True, help="папка в models/")
+    parser.add_argument("--model", required=True, help="папка в models/ с LightGBM")
+    parser.add_argument("--mlp", default=None, help="папка в models/ с MLP для ансамбля")
+    parser.add_argument("--mlp-only", action="store_true", help="только MLP, без LightGBM")
     parser.add_argument("--data-dir", type=Path, default=RERANK)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--compare", default="benchmark",
                         help="папка results/ с прошлым ответом для сравнения")
     parser.add_argument("--name", default=None, help="папка результатов (по умолчанию benchmark_<модель>)")
     args = parser.parse_args(argv)
-    name = args.name or f"benchmark_{args.model}"
+    name = args.name or "benchmark_" + "_".join(
+        [m for m in (None if args.mlp_only else args.model, args.mlp) if m])
     t_start = time.time()
     log(f"ответ на бенчмарк переранжировщиком {args.model}, топ-{args.top_k}")
 
@@ -55,7 +84,13 @@ def main(argv: list[str] | None = None) -> int:
           f"признаков модели: {len(features)}")
 
     with step("скоры и топ по запросу"):
-        feats["score"] = model.predict(prepare_categorical(feats[features].copy()))
+        s_lgb = model.predict(prepare_categorical(feats[features].copy()))
+        if args.mlp:
+            s_mlp = mlp_scores(args.mlp, args.data_dir)
+            rank = lambda s: pd.Series(s).groupby(feats.qid.to_numpy()).rank(pct=True).to_numpy()
+            feats["score"] = rank(s_mlp) if args.mlp_only else rank(s_lgb) + rank(s_mlp)
+        else:
+            feats["score"] = s_lgb
         feats = feats.sort_values(["qid", "score"], ascending=[True, False], kind="stable")
         feats["rank"] = feats.groupby("qid").cumcount() + 1
         top = feats[feats["rank"] <= args.top_k]
@@ -89,7 +124,8 @@ def main(argv: list[str] | None = None) -> int:
         save_answer(answer, out / "answer.csv")
         predictions.to_parquet(out / "predictions.parquet", index=False)
         (out / "config.json").write_text(json.dumps(
-            {"model": args.model, "top_k": args.top_k, "features": features},
+            {"model": args.model, "mlp": args.mlp, "mlp_only": args.mlp_only,
+             "top_k": args.top_k, "features": features},
             ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"answer.csv: {out / 'answer.csv'}")
     log(f"готово за {(time.time() - t_start) / 60:.1f} мин")

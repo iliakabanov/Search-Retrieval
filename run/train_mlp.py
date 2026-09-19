@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from data import load_catalog
 from features import CATEGORICAL
@@ -40,9 +41,11 @@ CAT_KEYS = list(EMBEDDINGS)
 
 def load_part(part: str, data_dir: Path, numeric: list[str], items: pd.DataFrame) -> pd.DataFrame:
     """Признаки части + сырые категории для эмбеддингов."""
-    cols = ["qid", "item_idx", "label", "it_microcat"] + numeric + (
-        ["val_part"] if part == "val" else [])
-    df = pd.read_parquet(data_dir / f"{part}_features.parquet", columns=cols)
+    path = data_dir / f"{part}_features.parquet"
+    available = set(pq.ParquetFile(path).schema_arrow.names)
+    cols = ["qid", "item_idx", "it_microcat"] + numeric + [
+        c for c in ("label", "val_part") if c in available]     # у бенчмарка меток нет
+    df = pd.read_parquet(path, columns=cols)
     events = pd.read_parquet(data_dir / f"{part}_events.parquet",
                              columns=["qid", "search_location_id", "filter_category"]).set_index("qid")
     idx = df.item_idx.to_numpy()

@@ -48,6 +48,10 @@ VARIANTS = ("без отсечения", "только фильтры", "тол�
 FILLED, FILL_MAIN, FILL_EXTRA = "гео + добивка", "только гео", "только фильтры"
 REPORT_VARIANTS = VARIANTS + (FILLED,)
 
+#: Пул только из соседних локаций города запроса (geo.neighbor_map) — для отдельной
+#: квоты кандидатов переранжировщика; в оценке ретриверов не участвует.
+NEIGHBORS = "соседи"
+
 
 def filter_key(df: pd.DataFrame) -> list[tuple]:
     """Комбинация фильтров события: (вид, типы, предметы, онлайн-запись)."""
@@ -60,10 +64,18 @@ def filter_key(df: pd.DataFrame) -> list[tuple]:
 class CandidatePools:
     """Пулы кандидатов по каталогу `items` (атрибуты из `data.FILTER_ITEM_COLUMNS`)."""
 
-    def __init__(self, items: pd.DataFrame, region_map: dict[int, list[int]] | None = None):
-        """`region_map` — {регион: локации объявлений} для запросов с регионом (geo.py)."""
+    def __init__(self, items: pd.DataFrame, region_map: dict[int, list[int]] | None = None,
+                 neighbors: dict[int, list[int]] | None = None, geo_mode: str = "city"):
+        """`region_map` — {регион: локации объявлений} для запросов с регионом (geo.py);
+        `neighbors` — {город: соседние локации} (geo.neighbor_map); `geo_mode` — что
+        считать гео городского запроса: "city" — сам город, "city+neighbors" — город
+        и соседи, "neighbors" — только соседи (для отдельной квоты кандидатов)."""
+        if geo_mode not in ("city", "city+neighbors", "neighbors"):
+            raise ValueError(f"неизвестный geo_mode: {geo_mode}")
         self.n_items = len(items)
         self.region_map = region_map or {}
+        self.neighbors = neighbors or {}
+        self.geo_mode = geo_mode
         self._category = items.item_category.fillna("").to_numpy()
         self._subcategory = items.item_subcategory.fillna("").to_numpy()
         self._subjects = items.item_subjects.map(tuple).to_numpy()
@@ -78,14 +90,24 @@ class CandidatePools:
     def geo_codes(self, location_ids: pd.Series) -> list[tuple[int, ...]]:
         """Гео запроса — коды локаций каталога: у города — он сам, у региона — его
         локации из region_map; пусто, если в каталоге нет ни одной."""
+        known = self._loc_index.index
+        codes = lambda locs: tuple(sorted(int(self._loc_index[x]) for x in locs if x in known))
         cache: dict[int, tuple[int, ...]] = {}
         for loc in location_ids.unique():
-            if loc in self._loc_index.index:
-                cache[loc] = (int(self._loc_index[loc]),)
-            else:
-                cache[loc] = tuple(sorted(int(self._loc_index[x])
-                                          for x in self.region_map.get(loc, ())
-                                          if x in self._loc_index.index))
+            if loc in known:            # город
+                own = (int(self._loc_index[loc]),)
+                near = codes(self.neighbors.get(loc, ())) if self.geo_mode != "city" else ()
+                cache[loc] = {"city": own, "city+neighbors": tuple(sorted(own + near)),
+                              "neighbors": near}[self.geo_mode]
+            else:                       # регион
+                cache[loc] = codes(self.region_map.get(loc, ()))                     if self.geo_mode != "neighbors" else ()
+        return [cache[loc] for loc in location_ids]
+
+    def neighbor_codes(self, location_ids: pd.Series) -> list[tuple[int, ...]]:
+        """Коды соседних локаций города запроса (без него самого); у регионов — пусто."""
+        known = self._loc_index.index
+        cache = {loc: tuple(sorted(int(self._loc_index[x]) for x in self.neighbors.get(loc, ())
+                                   if x in known)) for loc in location_ids.unique()}
         return [cache[loc] for loc in location_ids]
 
     def in_geo(self, idx: np.ndarray, geo: tuple[int, ...]) -> np.ndarray:
@@ -111,7 +133,8 @@ class CandidatePools:
     def key(variant: str, fkey: tuple, geo: tuple[int, ...]) -> tuple:
         """События с одинаковым ключом делят один пул."""
         return {"без отсечения": (variant,), "только фильтры": (variant, fkey),
-                "только гео": (variant, geo), "фильтры + гео": (variant, fkey, geo)}[variant]
+                "только гео": (variant, geo), "фильтры + гео": (variant, fkey, geo),
+                NEIGHBORS: (variant, geo)}[variant]
 
     def indices(self, key: tuple) -> np.ndarray | None:
         """Индексы кандидатов в каталоге; None — весь каталог."""
@@ -121,7 +144,7 @@ class CandidatePools:
                 pool = None
             elif variant == "только фильтры":
                 pool = np.flatnonzero(self.mask(rest[0]))
-            elif variant == "только гео":
+            elif variant in ("только гео", NEIGHBORS):
                 pool = np.flatnonzero(self.in_geo(None, rest[0]))
             else:
                 pool = np.flatnonzero(self.mask(rest[0]) & self.in_geo(None, rest[1]))

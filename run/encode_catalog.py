@@ -5,11 +5,13 @@
 удобно запустить отдельно. Прерванный запуск продолжается с последней готовой части.
 
 Корпус: `catalog` — каталог валидации из dataset/split (для оценки),
-`benchmark` — benchmark_items (для ретрива по запросам бенчмарка).
+`benchmark` — benchmark_items (для ретрива по запросам бенчмарка), `train_extra` —
+объявления train вне каталога (для обучения переранжировщика на всём train).
 
     python run/encode_catalog.py
     python run/encode_catalog.py --models e5-large
     python run/encode_catalog.py --corpus benchmark
+    python run/encode_catalog.py --corpus train_extra
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import dense
-from data import TEXT_ITEM_COLUMNS, load_benchmark_items, load_catalog
+from data import TEXT_ITEM_COLUMNS, load_benchmark_items, load_catalog, load_train_extra_items
 from logs import log, step
 from texts import doc_texts
 
@@ -29,13 +31,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--models", nargs="+", default=list(dense.MODELS),
                         choices=list(dense.MODELS))
-    parser.add_argument("--corpus", default=dense.CATALOG, choices=[dense.CATALOG, dense.BENCHMARK],
-                        help="catalog — каталог валидации, benchmark — benchmark_items")
+    parser.add_argument("--corpus", default=dense.CATALOG,
+                        choices=[dense.CATALOG, dense.BENCHMARK, dense.TRAIN_EXTRA],
+                        help="catalog — каталог валидации, benchmark — benchmark_items, "
+                             "train_extra — объявления train вне каталога")
     args = parser.parse_args(argv)
 
     log(f"кодирование корпуса {args.corpus}: {', '.join(args.models)}")
     with step(f"читаем корпус {args.corpus}"):
-        load = load_catalog if args.corpus == dense.CATALOG else load_benchmark_items
+        load = {dense.CATALOG: load_catalog, dense.BENCHMARK: load_benchmark_items,
+                dense.TRAIN_EXTRA: load_train_extra_items}[args.corpus]
         items = load(TEXT_ITEM_COLUMNS)
     with step(f"собираем и чистим тексты {len(items):,} документов"):
         docs = doc_texts(items)

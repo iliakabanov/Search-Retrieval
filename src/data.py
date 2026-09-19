@@ -64,5 +64,18 @@ def load_benchmark_items(columns: list[str]) -> pd.DataFrame:
     return items.drop_duplicates("item_id").reset_index(drop=True)
 
 
+def load_train_extra_items(columns: list[str]) -> pd.DataFrame:
+    """Объявления train, которых нет в каталоге валидации (~155 тыс.), по item_id.
+
+    Вместе с каталогом это все объявления train — корпус для обучения
+    переранжировщика на всех событиях train_pairs (docs/reranker_plan.md, вариант 2).
+    """
+    catalog = set(pq.read_table(SPLIT / "catalog.parquet").to_pandas().item_id)
+    columns = ["item_id"] + [c for c in columns if c != "item_id"]
+    items = (pq.read_table(PROCESSED / "train.parquet", columns=columns).to_pandas()
+             .drop_duplicates("item_id"))
+    return items[~items.item_id.isin(catalog)].sort_values("item_id").reset_index(drop=True)
+
+
 def load_benchmark_queries() -> pd.DataFrame:
     return pq.read_table(PROCESSED / "benchmark_queries.parquet").to_pandas()
