@@ -11,6 +11,11 @@ per_event.parquet, recall.csv, config.json. Нужен torch_env и GPU.
 
     python run/train_mlp.py
     python run/train_mlp.py --epochs 20 --hidden 512 256 --name mlp_big
+    python run/train_mlp.py --features-from lgbm_nb --text-emb e5-large --name mlp_nb_text
+
+С --text-emb в сеть дополнительно подаются сами векторы запроса и объявления
+(src/mlp.py, текстовая часть): векторы объявлений — из кэша эмбеддингов каталога,
+запросов — кодируются и кэшируются в dataset/rerank/query_emb_*.
 """
 
 from __future__ import annotations
@@ -47,7 +52,8 @@ def load_part(part: str, data_dir: Path, numeric: list[str], items: pd.DataFrame
         c for c in ("label", "val_part") if c in available]     # у бенчмарка меток нет
     df = pd.read_parquet(path, columns=cols)
     events = pd.read_parquet(data_dir / f"{part}_events.parquet",
-                             columns=["qid", "search_location_id", "filter_category"]).set_index("qid")
+                             columns=["qid", "query", "search_location_id", "filter_category"]
+                             ).set_index("qid")
     idx = df.item_idx.to_numpy()
     ev = events.loc[df.qid.to_numpy()]
     df["microcat"] = df.pop("it_microcat")
@@ -55,7 +61,27 @@ def load_part(part: str, data_dir: Path, numeric: list[str], items: pd.DataFrame
     df["item_loc"] = items.item_location_id.to_numpy()[idx]
     df["query_loc"] = ev.search_location_id.to_numpy()
     df["query_category"] = ev.filter_category.fillna("").to_numpy()
+    df["query_text"] = ev["query"].to_numpy()
     return df
+
+
+class TextVectors:
+    """Векторы запросов и объявлений на GPU для текстовой части MLP.
+
+    `rows(df)` — номера строк (запрос, объявление) для каждой пары df.
+    """
+
+    def __init__(self, name: str, texts, item_ids, corpus: str, cache_tag: str):
+        import dense
+
+        self.texts = pd.Index(pd.unique(np.asarray(texts, dtype=object)))
+        self.q = torch.from_numpy(dense.query_embeddings(
+            name, self.texts.to_numpy(), RERANK / f"query_emb_{name}_{cache_tag}")).cuda()
+        self.d = torch.from_numpy(dense.catalog_embeddings(name, item_ids, corpus=corpus)).cuda()
+
+    def rows(self, df: pd.DataFrame) -> tuple[torch.Tensor, torch.Tensor]:
+        return (torch.from_numpy(self.texts.get_indexer(df.query_text.to_numpy()).astype(np.int64)),
+                torch.from_numpy(df.item_idx.to_numpy(dtype=np.int64)))
 
 
 def tensors(df: pd.DataFrame, prep: Preprocessor, vocabs: dict[str, Vocab]):
@@ -65,12 +91,19 @@ def tensors(df: pd.DataFrame, prep: Preprocessor, vocabs: dict[str, Vocab]):
 
 
 @torch.no_grad()
-def predict(model, num, cats, batch: int = 200_000) -> np.ndarray:
+def predict(model, num, cats, text=None, batch: int = 200_000) -> np.ndarray:
+    """`text` — (TextVectors, номера запросов, номера объявлений) для текстовой части."""
     model.eval()
     out = []
     for s in range(0, len(num), batch):
+        vecs = {}
+        if text is not None:
+            tv, q_rows, d_rows = text
+            vecs = {"q_vec": tv.q[q_rows[s:s + batch].cuda()],
+                    "d_vec": tv.d[d_rows[s:s + batch].cuda()]}
         out.append(model(num[s:s + batch].cuda().float(),
-                         {k: v[s:s + batch].cuda().long() for k, v in cats.items()}).float().cpu())
+                         {k: v[s:s + batch].cuda().long() for k, v in cats.items()},
+                         **vecs).float().cpu())
     return torch.cat(out).numpy()
 
 
@@ -89,6 +122,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--text-emb", default=None, choices=[None, "e5-large", "RoSBERTa"],
+                        help="подавать в сеть векторы запроса и объявления этой модели")
+    parser.add_argument("--text-dim", type=int, default=64,
+                        help="до скольких чисел сжимать векторы")
     parser.add_argument("--name", default="mlp")
     args = parser.parse_args(argv)
     t_start = time.time()
@@ -114,6 +151,14 @@ def main(argv: list[str] | None = None) -> int:
         vocabs = {k: Vocab(train[k].to_numpy()) for k in CAT_KEYS}
         num_tr, cats_tr = tensors(train, prep, vocabs)
         num_va, cats_va = tensors(val, prep, vocabs)
+        text_tr = text_va = None
+        if args.text_emb:
+            from dense import CATALOG
+            tv = TextVectors(args.text_emb, np.concatenate([train.query_text.unique(),
+                                                             val.query_text.unique()]),
+                             items.item_id, CATALOG, "train_val")
+            text_tr, text_va = (tv, *tv.rows(train)), (tv, *tv.rows(val))
+            print(f"  векторы {args.text_emb}: запросов {len(tv.texts):,}, объявлений {len(tv.d):,}")
         labels_tr = torch.from_numpy(train.label.to_numpy(dtype=np.float32))
         # группы: индексы строк каждого события, дополненные до одной длины
         starts = np.flatnonzero(np.r_[True, train.qid.to_numpy()[1:] != train.qid.to_numpy()[:-1]])
@@ -128,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     print("  размеры словарей: " + ", ".join(f"{k} {len(v):,}" for k, v in vocabs.items()))
 
     model = RerankMLP(prep.n_out, {k: len(v) for k, v in vocabs.items()}, args.hidden,
-                      args.dropout).cuda()
+                      args.dropout, text_dim=args.text_dim if args.text_emb else 0).cuda()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     tune_mask = (val.val_part == "tune").to_numpy()
     tune_df = val[tune_mask]
@@ -143,15 +188,22 @@ def main(argv: list[str] | None = None) -> int:
                 rows = torch.from_numpy(pad[order[b:b + args.groups_per_batch]])
                 mask = rows >= 0
                 flat = rows.clamp(min=0).reshape(-1)
+                vecs = {}
+                if text_tr is not None:
+                    tv, q_rows, d_rows = text_tr
+                    vecs = {"q_vec": tv.q[q_rows[flat].cuda()], "d_vec": tv.d[d_rows[flat].cuda()]}
                 scores = model(num_tr[flat].cuda().float(),
-                               {k: v[flat].cuda().long() for k, v in cats_tr.items()})
+                               {k: v[flat].cuda().long() for k, v in cats_tr.items()}, **vecs)
                 loss = listwise_loss(scores.view(rows.shape), labels_tr[flat].cuda().view(rows.shape),
                                      mask.cuda())
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
                 losses.append(loss.item())
-            tune_score = predict(model, num_va[tune_mask], {k: v[tune_mask] for k, v in cats_va.items()})
+            tune_text = None if text_va is None else (
+                text_va[0], text_va[1][tune_mask], text_va[2][tune_mask])
+            tune_score = predict(model, num_va[tune_mask],
+                                 {k: v[tune_mask] for k, v in cats_va.items()}, tune_text)
             tune_recall = top_k_recall(tune_df, tune_score, val_events.n_pos[
                 val_events.val_part == "tune"], args.top_k).mean()
         print(f"  loss {np.mean(losses):.4f} | recall@{args.top_k} val-tune {tune_recall:.2%}")
@@ -166,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     model.load_state_dict(best_state)
 
     with step("оценка на валидации (MLP, LightGBM, ансамбль)"):
-        s_mlp = predict(model, num_va, cats_va)
+        s_mlp = predict(model, num_va, cats_va, text_va)
         lgb_model = lgb.Booster(model_str=(lgb_dir / "model.txt").read_text(encoding="utf-8"))
         s_lgb = lgb_model.predict(prepare_categorical(
             pd.read_parquet(args.data_dir / "val_features.parquet",

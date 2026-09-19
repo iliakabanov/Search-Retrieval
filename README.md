@@ -136,6 +136,7 @@ benchmark_items обеими dense-моделями (около 2 часов, к
 | 2 | RRF (BM25 + e5-large + RoSBERTa), «гео + добивка», гео регионов 0.95 (по умолчанию) | 87.83% | 85% | 85.18% |
 | 3 | переранжировщик LightGBM поверх 300 кандидатов, без статистик объявления (`lgbm_no_item_stats`) | 92.83%** | 87–89% | **87.49%** |
 | 4 | 500 кандидатов (330 гео / 85 соседей ≤ 50 км / 85 вне гео, глубина RRF 500), ансамбль LightGBM + MLP (`lgbm_nb` + `mlp_nb`) | 94.20%** | 88.0–88.3% | 87.31% |
+| 5 | те же кандидаты, только MLP с векторами e5 запроса и объявления (`mlp_nb_text`, `--text-emb e5-large`) | 94.56%** | 87.3–88% | **87.95%** |
 
 \* Валидация, перевзвешенная под долю запросов с регионом вместо города (17.3%
 на бенчмарке против 12% на валидации), минус ~2 п.п. — разница валидации и
@@ -176,9 +177,22 @@ benchmark_items обеими dense-моделями (около 2 часов, к
 ```bash
 python run/build_candidates.py --parts train val benchmark
 python run/build_features.py --parts train val benchmark
-python run/train_reranker.py --drop-features st_item_pop_log st_text_item --name lgbm_no_item_stats
-python run/rerank_benchmark.py --model lgbm_no_item_stats   # -> results/benchmark_lgbm_no_item_stats/answer.csv
+python run/train_reranker.py --drop-features st_item_pop_log st_text_item --name lgbm_nb
+python run/train_mlp.py --features-from lgbm_nb --text-emb e5-large --name mlp_nb_text
+python run/rerank_benchmark.py --model lgbm_nb --mlp mlp_nb_text --mlp-only   # -> results/benchmark_mlp_nb_text/answer.csv
 ```
+
+**Итоговое решение (попытка 5, 87.95% на бенчмарке)** — эти команды со значениями
+по умолчанию: 500 кандидатов (330 из гео запроса, 85 из соседних локаций ≤ 50 км,
+85 вне гео), RRF по 500 лучших от BM25, e5-large и RoSBERTa; переранжировщик — MLP
+с lookup-эмбеддингами (микрокатегория, вид услуги, локации) и векторами e5 запроса
+и объявления, сжатыми до 64. LightGBM (`lgbm_nb`) нужен только как источник списка
+признаков. На val-test: 94.56% (город 95.68%, регион 86.70%); прирост от векторов e5
+на новых объявлениях (+0.46 п.п.) не меньше, чем на известных по train (+0.32), то
+есть это не запоминание объявлений.
+
+Ниже — первая версия переранжировщика (попытка 3: 300 кандидатов без соседей,
+LightGBM), с которой начиналось сравнение.
 
 | модель (val-test, recall@50) | всего | город | регион |
 |---|---|---|---|

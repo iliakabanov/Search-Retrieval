@@ -39,7 +39,7 @@ def mlp_scores(name: str, data_dir: Path) -> np.ndarray:
     """Скоры MLP для строк benchmark_features (в их порядке)."""
     import torch
     from mlp import Preprocessor, RerankMLP, Vocab
-    from train_mlp import load_part, predict, tensors
+    from train_mlp import TextVectors, load_part, predict, tensors
 
     folder = ROOT / "models" / name
     config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
@@ -49,11 +49,17 @@ def mlp_scores(name: str, data_dir: Path) -> np.ndarray:
               for k, v in saved["vocabs"].items()}
     items = load_benchmark_items(["item_category", "item_location_id"])
     df = load_part("benchmark", data_dir, config["numeric"], items)
+    text_emb = config.get("text_emb")
     model = RerankMLP(prep.n_out, {k: len(v) for k, v in vocabs.items()}, config["hidden"],
-                      config["dropout"]).cuda()
+                      config["dropout"], text_dim=config["text_dim"] if text_emb else 0).cuda()
     model.load_state_dict(torch.load(folder / "model.pt"))
     num, cats = tensors(df, prep, vocabs)
-    return predict(model, num, cats)
+    text = None
+    if text_emb:
+        from dense import BENCHMARK
+        tv = TextVectors(text_emb, df.query_text.unique(), items.item_id, BENCHMARK, "benchmark")
+        text = (tv, *tv.rows(df))
+    return predict(model, num, cats, text)
 
 
 def main(argv: list[str] | None = None) -> int:

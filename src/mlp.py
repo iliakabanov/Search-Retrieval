@@ -111,23 +111,39 @@ class Vocab:
 
 
 class RerankMLP(nn.Module):
+    """`text_dim > 0` — текстовая часть: векторы запроса и объявления (e5, 1024 числа)
+    сжимаются линейными слоями до `text_dim` и подаются в сеть как [q, d, q⊙d].
+    Сжатие и dropout ограничивают запоминание конкретных объявлений по их векторам."""
+
     def __init__(self, n_num: int, vocab_sizes: dict[str, int], hidden=(256, 128),
-                 dropout: float = 0.1):
+                 dropout: float = 0.1, text_dim: int = 0, text_in: int = 1024,
+                 text_dropout: float = 0.2):
         super().__init__()
+        self.text_dim = text_dim
+        if text_dim:
+            self.proj_q = nn.Linear(text_in, text_dim)
+            self.proj_d = nn.Linear(text_in, text_dim)
+            self.text_drop = nn.Dropout(text_dropout)
         self.emb = nn.ModuleDict({k: nn.Embedding(vocab_sizes[k], d) for k, d in EMBEDDINGS.items()})
         self.aff_query = nn.Embedding(vocab_sizes["query_loc"], AFFINITY_DIM)
         self.aff_item = nn.Embedding(vocab_sizes["item_loc"], AFFINITY_DIM)
-        layers, d_in = [], n_num + sum(EMBEDDINGS.values()) + 1
+        layers, d_in = [], n_num + sum(EMBEDDINGS.values()) + 1 + 3 * text_dim
         for h in hidden:
             layers += [nn.Linear(d_in, h), nn.ReLU(), nn.Dropout(dropout)]
             d_in = h
         layers.append(nn.Linear(d_in, 1))
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, num: torch.Tensor, cats: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, num: torch.Tensor, cats: dict[str, torch.Tensor],
+                q_vec: torch.Tensor | None = None, d_vec: torch.Tensor | None = None
+                ) -> torch.Tensor:
         affinity = (self.aff_query(cats["query_loc"]) * self.aff_item(cats["item_loc"])).sum(-1)
-        x = torch.cat([num] + [self.emb[k](cats[k]) for k in EMBEDDINGS]
-                      + [affinity.unsqueeze(-1)], dim=-1)
+        parts = [num] + [self.emb[k](cats[k]) for k in EMBEDDINGS] + [affinity.unsqueeze(-1)]
+        if self.text_dim:
+            q = self.text_drop(self.proj_q(q_vec.float()))
+            d = self.text_drop(self.proj_d(d_vec.float()))
+            parts += [q, d, q * d]
+        x = torch.cat(parts, dim=-1)
         return self.mlp(x).squeeze(-1)
 
 

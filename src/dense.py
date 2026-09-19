@@ -111,6 +111,29 @@ def catalog_embeddings(name: str, item_ids, docs: list[str] | None = None,
     return np.concatenate([np.load(folder / f"part_{i:03d}.npy") for i in range(n_parts)])
 
 
+def query_embeddings(name: str, texts, cache) -> np.ndarray:
+    """Эмбеддинги текстов запросов (в порядке `texts`) с кэшем.
+
+    Кэш — пара файлов <cache>.npy и <cache>.texts.npy; пересчитывается, если набор
+    текстов изменился.
+    """
+    from pathlib import Path
+
+    texts = np.asarray(texts, dtype=object)
+    cache = Path(cache)
+    emb_path = cache.with_suffix(".npy")
+    texts_path = cache.with_name(cache.name + ".texts.npy")
+    if emb_path.exists() and texts_path.exists():
+        cached = np.load(texts_path, allow_pickle=True)
+        if len(cached) == len(texts) and (cached == texts).all():
+            return np.load(emb_path)
+    model = load_model(name)
+    emb = encode(model, list(texts), MODELS[name].query_prefix, progress=True)
+    np.save(emb_path, emb)
+    np.save(texts_path, texts)
+    return emb
+
+
 class DenseRetriever:
     """Ретривер по косинусу; эмбеддинги каталога и запросов лежат на GPU."""
 
