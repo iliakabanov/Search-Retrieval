@@ -43,17 +43,18 @@ def top_k_recall(df: pd.DataFrame, score: np.ndarray, n_pos: pd.Series, k: int) 
 
 
 def report(val: pd.DataFrame, scores: dict[str, np.ndarray], val_events: pd.DataFrame,
-           baseline: pd.Series, k: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+           baseline: pd.Series | None, k: int) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Recall@k на val-tune / val-test (+ город / регион) для нескольких скоров.
 
-    `scores` — {название модели: скор каждой строки val}; `baseline` — recall нынешнего
-    метода по событиям. Возвращает таблицу и recall по событиям.
+    `scores` — {название модели: скор каждой строки val}; `baseline` — recall первого
+    этапа по событиям (из results/<...>/per_event.parquet) или None, если его не
+    считали. Возвращает таблицу и recall по событиям.
     """
     per_event = val_events[["val_part", "is_region", "slice"]].assign(
-        **{"RRF (сейчас)": baseline},
+        **({"RRF (сейчас)": baseline} if baseline is not None else {}),
         **{name: top_k_recall(val, s, val_events.n_pos, k) for name, s in scores.items()},
         **{"потолок кандидатов": top_k_recall(val, np.zeros(len(val)), val_events.n_pos, 10 ** 6)})
-    columns = ["RRF (сейчас)", *scores, "потолок кандидатов"]
+    columns = (["RRF (сейчас)"] if baseline is not None else []) + [*scores, "потолок кандидатов"]
     rows = {}
     for part in ("tune", "test"):
         p = per_event[per_event.val_part == part]
@@ -61,8 +62,9 @@ def report(val: pd.DataFrame, scores: dict[str, np.ndarray], val_events: pd.Data
         for grp, mask in (("город", ~p.is_region.astype(bool)), ("регион", p.is_region.astype(bool))):
             rows[f"val-{part}, {grp}"] = p[mask][columns].mean()
     table = pd.DataFrame(rows).T
-    for name in scores:
-        table[f"прирост {name}, п.п."] = (table[name] - table["RRF (сейчас)"]) * 100
+    if baseline is not None:
+        for name in scores:
+            table[f"прирост {name}, п.п."] = (table[name] - table["RRF (сейчас)"]) * 100
     return table, per_event
 
 

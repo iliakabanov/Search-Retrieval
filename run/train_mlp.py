@@ -84,6 +84,20 @@ class TextVectors:
                 torch.from_numpy(df.item_idx.to_numpy(dtype=np.int64)))
 
 
+def load_baseline(name: str, index) -> pd.Series | None:
+    """Recall первого этапа по событиям — для колонки сравнения; может отсутствовать.
+
+    Файл появляется после run/evaluate_retrievers.py; если его нет, отчёт печатается
+    без колонки «RRF (сейчас)».
+    """
+    path = RESULTS / name / "per_event.parquet"
+    if not path.exists():
+        log(f"нет {path} — таблица без сравнения с первым этапом "
+            f"(посчитать: python run/evaluate_retrievers.py)")
+        return None
+    return pd.read_parquet(path)["RRF | гео + добивка"].reindex(index)
+
+
 def tensors(df: pd.DataFrame, prep: Preprocessor, vocabs: dict[str, Vocab]):
     num = torch.from_numpy(prep.transform(df))
     cats = {k: torch.from_numpy(vocabs[k].encode(df[k].to_numpy())) for k in CAT_KEYS}
@@ -234,8 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                                 columns=lgb_config["features"])))
             rank = lambda s: pd.Series(s).groupby(val.qid.to_numpy()).rank(pct=True).to_numpy()
             scores["ансамбль"] = rank(scores["MLP"]) + rank(scores["LightGBM"])
-        base = pd.read_parquet(RESULTS / args.baseline / "per_event.parquet")[
-            "RRF | гео + добивка"].reindex(val_events.index)
+        base = load_baseline(args.baseline, val_events.index)
         table, per_event = report(val, scores, val_events, base, args.top_k)
     print(f"\nrecall@{args.top_k}")
     print(format_report(table))

@@ -107,8 +107,13 @@ def main(argv: list[str] | None = None) -> int:
                               num_iteration=model.best_iteration)
         recall = top_k_recall(val, score, val_events.n_pos, args.top_k)
         cand_recall = top_k_recall(val, np.zeros(len(val)), val_events.n_pos, 10 ** 6)
-        base = pd.read_parquet(RESULTS / args.baseline / "per_event.parquet")
-        base = base["RRF | гео + добивка"].reindex(val_events.index)
+        base_path = RESULTS / args.baseline / "per_event.parquet"
+        if base_path.exists():      # появляется после run/evaluate_retrievers.py
+            base = pd.read_parquet(base_path)["RRF | гео + добивка"].reindex(val_events.index)
+        else:
+            log(f"нет {base_path} — таблица без сравнения с первым этапом "
+                f"(посчитать: python run/evaluate_retrievers.py)")
+            base = np.nan
         rep = val_events[["val_part", "is_region", "slice"]].assign(
             reranker=recall, baseline=base, candidates=cand_recall)
 
