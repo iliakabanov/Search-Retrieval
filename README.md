@@ -39,72 +39,87 @@
 
 ## Как воспроизвести ответ
 
-Команды запускаются из корня репозитория по порядку, каждая читает результат
-предыдущей. Значения по умолчанию воспроизводят отправленный `answer.csv`.
+Ответ — **`results/benchmark_mlp_nb_text/answer.csv`**; перед сохранением он
+проверяется на все требования к формату (`src/answer.py`). Значения по умолчанию
+во всех командах воспроизводят отправленный файл.
+
+Есть три сценария: выбирайте по тому, сколько готовы ждать. Промежуточные
+результаты выложены на Hugging Face
+([iliakabanov/search-retrieval](https://huggingface.co/datasets/iliakabanov/search-retrieval)),
+и сценарии Б и В их используют. Это **необязательный** ускоритель: сценарий А
+считает всё с нуля и ничего не скачивает, кроме весов открытых моделей.
+
+### А. Всё с нуля — примерно 6 часов
 
 ```bash
-python run/preprocess.py                                   # ~2 мин: чистка и разбор параметров
-python run/make_split.py                                   # ~10 с: train/val и каталог для валидации
-python run/encode_catalog.py                               # ~1 ч на модель: эмбеддинги каталога
-python run/encode_catalog.py --corpus benchmark            # ~1 ч на модель: эмбеддинги корпуса бенчмарка
-python run/build_candidates.py --parts train val benchmark # ~40 мин: по 500 кандидатов на запрос
-python run/build_features.py --parts train val benchmark   # ~45 мин: признаки пар
-python run/train_mlp.py --text-emb e5-large --name mlp_nb_text   # ~6 мин: обучение переранжировщика
-python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин: ответ
+python run/preprocess.py                                   # ~3 мин   чистка и разбор параметров объявлений
+python run/make_split.py                                   # ~10 с    train/val и каталог для валидации
+python run/encode_catalog.py                               # ~2 ч     эмбеддинги каталога (две модели)
+python run/encode_catalog.py --corpus benchmark            # ~2 ч     эмбеддинги корпуса бенчмарка
+python run/build_candidates.py --parts train val benchmark # ~40 мин  по 500 кандидатов на запрос
+python run/build_features.py --parts train val benchmark   # ~45 мин  признаки пар
+python run/train_mlp.py --text-emb e5-large --name mlp_nb_text  # ~6 мин  обучение переранжировщика
+python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин   ответ
 ```
 
-Ответ: **`results/benchmark_mlp_nb_text/answer.csv`**. Перед сохранением он
-проверяется на все требования к формату (`src/answer.py`): две колонки, 2 452
-строки, до 50 существующих `item_id` через пробел без повторов.
+Кодирование — самый долгий шаг, но кэшируется по частям в `dataset/embeddings/`:
+прерванный запуск продолжается с последнего места.
 
-Кодирование эмбеддингов — самый долгий шаг, но он кэшируется по частям в
-`dataset/embeddings/` и продолжается после прерывания. Обученная модель лежит в
-`models/mlp_nb_text/`, поэтому шаг обучения можно пропустить.
+### Б. Без кодирования эмбеддингов — примерно 1.5 часа
 
-### Быстрый путь: готовые артефакты
-
-Чтобы не ждать кодирования, промежуточные результаты выложены на Hugging Face:
-[iliakabanov/search-retrieval](https://huggingface.co/datasets/iliakabanov/search-retrieval).
-Это **необязательный** ускоритель: без него всё считается локально командами выше.
+Скачиваем готовые эмбеддинги (1.5 ГБ), остальное считаем сами.
 
 ```bash
-# 1. ответ за минуту: кандидаты и признаки бенчмарка (51 МБ)
-python run/artifacts.py --sets rerank
-python run/rerank_benchmark.py --mlp mlp_nb_text
-
-# 2. обучить переранжировщик заново: признаки и события train и val (966 МБ)
-python run/artifacts.py --sets train
-python run/train_mlp.py --text-emb e5-large --name mlp_nb_text
-
-# 3. пройти весь пайплайн, пропустив кодирование: эмбеддинги корпусов (1.5 ГБ)
-python run/artifacts.py --sets embeddings
+python run/preprocess.py                                   # ~3 мин
+python run/make_split.py                                   # ~10 с
+python run/artifacts.py --sets embeddings                  # ~15 мин  зависит от скорости сети
+python run/build_candidates.py --parts train val benchmark # ~40 мин
+python run/build_features.py --parts train val benchmark   # ~45 мин
+python run/train_mlp.py --text-emb e5-large --name mlp_nb_text  # ~6 мин
+python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин
 ```
 
-Скачанное кладётся туда же, куда его записали бы скрипты (`dataset/rerank/`,
-`dataset/embeddings/`), и дальше пайплайн работает как обычно.
+### В. Только обучение модели и ответ — примерно 20 минут
 
-Вариант 1 пропускает и обучение: веса переранжировщика лежат в репозитории
-(`models/mlp_nb_text/`, 1.8 МБ). Вариант 2 печатает те же метрики на валидации,
-что в [SOLUTION.md](SOLUTION.md). Проверено: ответ, собранный из скачанных
-артефактов, побайтово совпадает с отправленным на платформу.
-
-### Проверка работоспособности
-
-Без dense-моделей, несколько минут (качество ниже — это решение первой попытки,
-75.18%):
+Скачиваем готовые признаки (966 МБ для обучения и 51 МБ для бенчмарка), сразу
+обучаем переранжировщик и собираем ответ. Сырые данные задания при этом не нужны.
 
 ```bash
-python run/retrieve_benchmark.py --retrievers BM25 --name benchmark_bm25
+python run/artifacts.py --sets train rerank                # ~10 мин  зависит от скорости сети
+python run/train_mlp.py --text-emb e5-large --name mlp_nb_text  # ~6 мин  обучение и метрики на валидации
+python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин   ответ
 ```
+
+Обучение печатает те же метрики на валидации, что приведены в
+[SOLUTION.md](SOLUTION.md).
+
+**Ещё быстрее:** веса обученной модели лежат в репозитории
+(`models/mlp_nb_text/`, 1.8 МБ), поэтому обучение можно пропустить и получить
+ответ за минуту:
+
+```bash
+python run/artifacts.py --sets rerank                      # ~1 мин   51 МБ
+python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин
+```
+
+Проверено: ответ, собранный из скачанных артефактов, побайтово совпадает с
+отправленным на платформу.
 
 ## Оценка качества на своей валидации
 
+**Итоговое решение** оценивает само обучение (`run/train_mlp.py` в любом из
+сценариев): оно печатает recall@50 на val-test с разбивкой на города и регионы и
+потолок кандидатов — 94.56% против 87.92% у первого этапа.
+
+**Первый этап отдельно** (ретриверы BM25, e5, RoSBERTa, их RRF и варианты
+отсечения кандидатов) — отдельная команда; нужны данные и эмбеддинги каталога,
+то есть сценарий А или Б:
+
 ```bash
-python run/evaluate_retrievers.py    # ~6 мин: ретриверы и отсечения, recall@50 по срезам
-python run/train_mlp.py --text-emb e5-large --name mlp_nb_text   # печатает recall@50 переранжировщика
+python run/evaluate_retrievers.py    # ~6 мин -> results/retrievers/
 ```
 
-Разбиение и метрики описаны в [SOLUTION.md](SOLUTION.md).
+Как устроено разбиение и что означают метрики — в [SOLUTION.md](SOLUTION.md).
 
 ## Структура репозитория
 
