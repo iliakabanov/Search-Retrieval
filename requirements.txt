@@ -1,0 +1,22 @@
+# Версии — те, на которых получен результат (Python 3.11, Windows, CUDA 12.8).
+# Установка torch под свою видеокарту: https://pytorch.org/get-started/locally/
+# например: pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+
+# кодирование текстов dense-моделями, обучение MLP
+torch==2.11.0
+sentence-transformers==5.6.1
+transformers==4.57.6
+huggingface-hub==0.36.2
+
+# данные и вычисления
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==23.0.1
+scipy==1.14.1          # разреженные матрицы BM25
+scikit-learn==1.8.0    # CountVectorizer для матрицы частот BM25
+snowballstemmer==3.1.1 # стеммер русского языка для BM25
+tqdm==4.66.5           # прогресс долгих шагов
+
+# необязательное
+lightgbm==4.7.0        # эксперимент с бустингом (run/train_reranker.py), в решении не нужен
+matplotlib==3.10.8     # графики в notebooks/

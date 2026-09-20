@@ -70,12 +70,13 @@ class TextVectors:
     `rows(df)` — номера строк (запрос, объявление) для каждой пары df.
     """
 
-    def __init__(self, name: str, texts, item_ids, corpus: str, cache_tag: str):
+    def __init__(self, name: str, texts, item_ids, corpus: str, cache_tag: str,
+                 cache_dir: Path = RERANK):
         import dense
 
         self.texts = pd.Index(pd.unique(np.asarray(texts, dtype=object)))
         self.q = torch.from_numpy(dense.query_embeddings(
-            name, self.texts.to_numpy(), RERANK / f"query_emb_{name}_{cache_tag}")).cuda()
+            name, self.texts.to_numpy(), cache_dir / f"query_emb_{name}_{cache_tag}")).cuda()
         self.d = torch.from_numpy(dense.catalog_embeddings(name, item_ids, corpus=corpus)).cuda()
 
     def rows(self, df: pd.DataFrame) -> tuple[torch.Tensor, torch.Tensor]:
@@ -159,7 +160,7 @@ def main(argv: list[str] | None = None) -> int:
             from dense import CATALOG
             tv = TextVectors(args.text_emb, np.concatenate([train.query_text.unique(),
                                                              val.query_text.unique()]),
-                             items.item_id, CATALOG, "train_val")
+                             items.item_id, CATALOG, "train_val", args.data_dir)
             text_tr, text_va = (tv, *tv.rows(train)), (tv, *tv.rows(val))
             print(f"  векторы {args.text_emb}: запросов {len(tv.texts):,}, объявлений {len(tv.d):,}")
         labels_tr = torch.from_numpy(train.label.to_numpy(dtype=np.float32))

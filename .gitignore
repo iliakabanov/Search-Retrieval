@@ -1,4 +1,13 @@
 dataset/
 *.pyc
-results/
-models/
+
+# модели: в репозитории только итоговый переранжировщик (1.8 МБ),
+# модели LightGBM из экспериментов весят сотни мегабайт
+models/*
+!models/mlp_nb_text/
+
+# результаты: в репозитории только отправленный ответ, остальное пересчитывается
+results/*
+!results/benchmark_mlp_nb_text/
+results/benchmark_mlp_nb_text/*
+!results/benchmark_mlp_nb_text/answer.csv

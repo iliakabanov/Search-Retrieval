@@ -21,9 +21,16 @@
 ## Что нужно для запуска
 
 * Python 3.11+, GPU с 8 ГБ памяти (на ней считаются эмбеддинги и обучается MLP);
-* библиотеки: `torch`, `sentence-transformers`, `pandas`, `numpy`, `scipy`,
-  `pyarrow`, `scikit-learn`, `snowballstemmer`, `tqdm`, `matplotlib`
-  (`lightgbm` — только для необязательного эксперимента с бустингом);
+* зависимости — `requirements.txt`:
+
+  ```bash
+  pip install -r requirements.txt
+  ```
+
+  `torch` в файле указан без сборки под CUDA: ставьте его по инструкции с
+  [pytorch.org](https://pytorch.org/get-started/locally/) под свою видеокарту
+  (результат получен на `torch 2.11.0+cu128`). `lightgbm` и `matplotlib` нужны
+  только для необязательного эксперимента с бустингом и ноутбуков;
 * данные задания в `dataset/`: `train.parquet`, `benchmark_queries.parquet`,
   `benchmark_items.parquet`.
 
@@ -54,8 +61,37 @@ python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин: отве
 `dataset/embeddings/` и продолжается после прерывания. Обученная модель лежит в
 `models/mlp_nb_text/`, поэтому шаг обучения можно пропустить.
 
-Быстрая проверка работоспособности без dense-моделей (несколько минут, качество
-ниже — это решение первой попытки, 75.18%):
+### Быстрый путь: готовые артефакты
+
+Чтобы не ждать кодирования, промежуточные результаты выложены на Hugging Face:
+[iliakabanov/search-retrieval](https://huggingface.co/datasets/iliakabanov/search-retrieval).
+Это **необязательный** ускоритель: без него всё считается локально командами выше.
+
+```bash
+# 1. ответ за минуту: кандидаты и признаки бенчмарка (51 МБ)
+python run/artifacts.py --sets rerank
+python run/rerank_benchmark.py --mlp mlp_nb_text
+
+# 2. обучить переранжировщик заново: признаки и события train и val (966 МБ)
+python run/artifacts.py --sets train
+python run/train_mlp.py --text-emb e5-large --name mlp_nb_text
+
+# 3. пройти весь пайплайн, пропустив кодирование: эмбеддинги корпусов (1.5 ГБ)
+python run/artifacts.py --sets embeddings
+```
+
+Скачанное кладётся туда же, куда его записали бы скрипты (`dataset/rerank/`,
+`dataset/embeddings/`), и дальше пайплайн работает как обычно.
+
+Вариант 1 пропускает и обучение: веса переранжировщика лежат в репозитории
+(`models/mlp_nb_text/`, 1.8 МБ). Вариант 2 печатает те же метрики на валидации,
+что в [SOLUTION.md](SOLUTION.md). Проверено: ответ, собранный из скачанных
+артефактов, побайтово совпадает с отправленным на платформу.
+
+### Проверка работоспособности
+
+Без dense-моделей, несколько минут (качество ниже — это решение первой попытки,
+75.18%):
 
 ```bash
 python run/retrieve_benchmark.py --retrievers BM25 --name benchmark_bm25

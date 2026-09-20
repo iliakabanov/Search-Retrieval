@@ -27,7 +27,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from answer import check_answer, make_answer, save_answer
@@ -59,7 +58,8 @@ def mlp_scores(name: str, data_dir: Path) -> np.ndarray:
     text = None
     if text_emb:
         from dense import BENCHMARK
-        tv = TextVectors(text_emb, df.query_text.unique(), items.item_id, BENCHMARK, "benchmark")
+        tv = TextVectors(text_emb, df.query_text.unique(), items.item_id, BENCHMARK,
+                         "benchmark", data_dir)
         text = (tv, *tv.rows(df))
     return predict(model, num, cats, text)
 
@@ -96,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
             parts["mlp"] = mlp_scores(args.mlp, args.data_dir)
         features = None
         if args.model:
+            import lightgbm as lgb      # нужен только для варианта с бустингом
+
             model_dir = ROOT / "models" / args.model
             config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
             features = config["features"]
