@@ -1,17 +1,17 @@
 """Обучение MLP-переранжировщика с lookup-эмбеддингами (src/mlp.py) и оценка.
 
-Те же данные и то же деление, что у LightGBM (run/train_reranker.py): обучение —
-train_features, ранняя остановка по recall@50 на val-tune, итог — val-test.
-Числовые признаки — как у модели `--features-from` (по умолчанию
-lgbm_no_item_stats). Дополнительно печатается ансамбль с этой LightGBM-моделью
-(среднее рангов внутри запроса).
+Обучение — train_features, ранняя остановка по recall@50 на val-tune, итог —
+val-test (docs/reranker_plan.md). Признаки — все из таблицы признаков, кроме
+`--drop-features` (по умолчанию статистики конкретного объявления: на бенчмарке
+90% объявлений не встречаются в train, и такие признаки туда не переносятся).
+С `--compare-lgbm` в отчёт добавляются LightGBM из models/<имя> и ансамбль с ним.
 
 Пишет в models/<имя>/: model.pt, prep.json (нормировка и словари),
 per_event.parquet, recall.csv, config.json. Нужен torch_env и GPU.
 
-    python run/train_mlp.py
+    python run/train_mlp.py --text-emb e5-large --name mlp_nb_text
     python run/train_mlp.py --epochs 20 --hidden 512 256 --name mlp_big
-    python run/train_mlp.py --features-from lgbm_nb --text-emb e5-large --name mlp_nb_text
+    python run/train_mlp.py --text-emb e5-large --compare-lgbm lgbm_nb --name mlp_cmp
 
 С --text-emb в сеть дополнительно подаются сами векторы запроса и объявления
 (src/mlp.py, текстовая часть): векторы объявлений — из кэша эмбеддингов каталога,
@@ -28,7 +28,6 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -38,8 +37,8 @@ from features import CATEGORICAL
 from logs import log, step
 from mlp import EMBEDDINGS, Preprocessor, RerankMLP, Vocab, listwise_loss
 from paths import RERANK, RESULTS, ROOT
-from rerank import (drop_groups_without_positives, format_report, prepare_categorical, report,
-                    top_k_recall)
+from rerank import (drop_groups_without_positives, feature_columns, format_report,
+                    prepare_categorical, report, top_k_recall)
 
 CAT_KEYS = list(EMBEDDINGS)
 
@@ -110,8 +109,12 @@ def predict(model, num, cats, text=None, batch: int = 200_000) -> np.ndarray:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data-dir", type=Path, default=RERANK)
-    parser.add_argument("--features-from", default="lgbm_no_item_stats",
-                        help="модель в models/, чей список признаков брать (и с кем ансамбль)")
+    parser.add_argument("--drop-features", nargs="*",
+                        default=["st_item_pop_log", "st_text_item"],
+                        help="признаки, которые не давать модели; по умолчанию статистики "
+                             "конкретного объявления — на бенчмарке 90%% объявлений новые")
+    parser.add_argument("--compare-lgbm", default=None,
+                        help="модель LightGBM в models/ для сравнения и ансамбля (необязательно)")
     parser.add_argument("--baseline", default="retrievers_regions")
     parser.add_argument("--hidden", type=int, nargs="+", default=[256, 128])
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -133,9 +136,9 @@ def main(argv: list[str] | None = None) -> int:
     rng = np.random.default_rng(args.seed)
     log(f"MLP-переранжировщик: {args.name}")
 
-    lgb_dir = ROOT / "models" / args.features_from
-    lgb_config = json.loads((lgb_dir / "config.json").read_text(encoding="utf-8"))
-    numeric = [f for f in lgb_config["features"] if f not in CATEGORICAL]
+    numeric = feature_columns(pq.ParquetFile(args.data_dir / "train_features.parquet")
+                              .schema_arrow.names)
+    numeric = [f for f in numeric if f not in CATEGORICAL and f not in set(args.drop_features)]
 
     with step("читаем признаки и категории"):
         items = load_catalog(["item_category", "item_location_id"])
@@ -217,18 +220,22 @@ def main(argv: list[str] | None = None) -> int:
                 break
     model.load_state_dict(best_state)
 
-    with step("оценка на валидации (MLP, LightGBM, ансамбль)"):
-        s_mlp = predict(model, num_va, cats_va, text_va)
-        lgb_model = lgb.Booster(model_str=(lgb_dir / "model.txt").read_text(encoding="utf-8"))
-        s_lgb = lgb_model.predict(prepare_categorical(
-            pd.read_parquet(args.data_dir / "val_features.parquet",
-                            columns=lgb_config["features"])))
-        rank = lambda s: pd.Series(s).groupby(val.qid.to_numpy()).rank(pct=True).to_numpy()
-        s_ens = rank(s_mlp) + rank(s_lgb)
+    with step("оценка на валидации"):
+        scores = {"MLP": predict(model, num_va, cats_va, text_va)}
+        if args.compare_lgbm:      # необязательное сравнение с бустингом и ансамбль с ним
+            import lightgbm as lgb
+
+            lgb_dir = ROOT / "models" / args.compare_lgbm
+            lgb_config = json.loads((lgb_dir / "config.json").read_text(encoding="utf-8"))
+            booster = lgb.Booster(model_str=(lgb_dir / "model.txt").read_text(encoding="utf-8"))
+            scores["LightGBM"] = booster.predict(prepare_categorical(
+                pd.read_parquet(args.data_dir / "val_features.parquet",
+                                columns=lgb_config["features"])))
+            rank = lambda s: pd.Series(s).groupby(val.qid.to_numpy()).rank(pct=True).to_numpy()
+            scores["ансамбль"] = rank(scores["MLP"]) + rank(scores["LightGBM"])
         base = pd.read_parquet(RESULTS / args.baseline / "per_event.parquet")[
             "RRF | гео + добивка"].reindex(val_events.index)
-        table, per_event = report(val, {"MLP": s_mlp, "LightGBM": s_lgb, "ансамбль": s_ens},
-                                  val_events, base, args.top_k)
+        table, per_event = report(val, scores, val_events, base, args.top_k)
     print(f"\nrecall@{args.top_k}")
     print(format_report(table))
 

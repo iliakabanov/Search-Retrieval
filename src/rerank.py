@@ -17,8 +17,10 @@ from features import CATEGORICAL
 SERVICE = ["qid", "item_idx", "label", "fold", "val_part"]
 
 
-def feature_columns(df: pd.DataFrame) -> list[str]:
-    return [c for c in df.columns if c not in SERVICE]
+def feature_columns(columns) -> list[str]:
+    """Признаки модели: колонки таблицы (или список имён) без служебных."""
+    names = columns.columns if isinstance(columns, pd.DataFrame) else columns
+    return [c for c in names if c not in SERVICE]
 
 
 def drop_groups_without_positives(df: pd.DataFrame) -> pd.DataFrame:

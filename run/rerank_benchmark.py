@@ -1,18 +1,20 @@
 """Ответ на бенчмарк переранжировщиком: топ-50 из кандидатов по скору модели.
 
 Нужны кандидаты и признаки бенчмарка (run/build_candidates.py --parts benchmark,
-run/build_features.py --parts benchmark) и обученная модель (run/train_reranker.py).
-Модель берёт те же признаки, что при обучении (список — в models/<имя>/config.json).
+run/build_features.py --parts benchmark) и обученная модель: MLP (run/train_mlp.py)
+и/или LightGBM (run/train_reranker.py). Модель берёт те же признаки, что при
+обучении (список — в models/<имя>/config.json).
 
 Пишет в results/<имя>/: answer.csv (проверяется на требования задания),
 predictions.parquet (query_id, rank, item_id, score), config.json. Печатает,
 насколько ответ совпадает с прошлым (RRF), — для контроля.
 
-    python run/rerank_benchmark.py --model lgbm_no_item_stats
-    python run/rerank_benchmark.py --model lgbm_nb --mlp mlp_nb     # ансамбль LightGBM + MLP
+    python run/rerank_benchmark.py --mlp mlp_nb_text                 # итоговое решение
+    python run/rerank_benchmark.py --model lgbm_nb                   # только LightGBM
+    python run/rerank_benchmark.py --mlp mlp_nb_text --model lgbm_nb # ансамбль
 
-С `--mlp` скор — сумма рангов (в долях) LightGBM и MLP внутри запроса, как в
-ансамбле на валидации (run/train_mlp.py); `--mlp-only` — только MLP.
+Если заданы обе модели, скор — сумма их рангов (в долях) внутри запроса, как в
+ансамбле на валидации (run/train_mlp.py).
 """
 
 from __future__ import annotations
@@ -64,39 +66,44 @@ def mlp_scores(name: str, data_dir: Path) -> np.ndarray:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", required=True, help="папка в models/ с LightGBM")
-    parser.add_argument("--mlp", default=None, help="папка в models/ с MLP для ансамбля")
-    parser.add_argument("--mlp-only", action="store_true", help="только MLP, без LightGBM")
+    parser.add_argument("--mlp", default=None, help="папка в models/ с MLP")
+    parser.add_argument("--model", default=None,
+                        help="папка в models/ с LightGBM (без --mlp — ответ только по нему, "
+                             "вместе с --mlp — ансамбль)")
     parser.add_argument("--data-dir", type=Path, default=RERANK)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--compare", default="benchmark",
                         help="папка results/ с прошлым ответом для сравнения")
     parser.add_argument("--name", default=None, help="папка результатов (по умолчанию benchmark_<модель>)")
     args = parser.parse_args(argv)
-    name = args.name or "benchmark_" + "_".join(
-        [m for m in (None if args.mlp_only else args.model, args.mlp) if m])
+    if not args.mlp and not args.model:
+        parser.error("нужен --mlp и/или --model")
+    name = args.name or "benchmark_" + "_".join(m for m in (args.model, args.mlp) if m)
     t_start = time.time()
-    log(f"ответ на бенчмарк переранжировщиком {args.model}, топ-{args.top_k}")
+    log(f"ответ на бенчмарк: {', '.join(m for m in (args.mlp, args.model) if m)}, "
+        f"топ-{args.top_k}")
 
-    model_dir = ROOT / "models" / args.model
-    with step("читаем модель, признаки и корпус"):
-        config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
-        model = lgb.Booster(model_str=(model_dir / "model.txt").read_text(encoding="utf-8"))
-        features = config["features"]
+    with step("читаем признаки и корпус"):
         feats = pd.read_parquet(args.data_dir / "benchmark_features.parquet")
         queries = load_benchmark_queries()
         item_ids = load_benchmark_items([]).item_id.to_numpy()
-    print(f"  запросов: {feats.qid.nunique():,} из {len(queries):,}, пар: {len(feats):,}, "
-          f"признаков модели: {len(features)}")
+    print(f"  запросов: {feats.qid.nunique():,} из {len(queries):,}, пар: {len(feats):,}")
 
     with step("скоры и топ по запросу"):
-        s_lgb = model.predict(prepare_categorical(feats[features].copy()))
+        rank = lambda s: pd.Series(s).groupby(feats.qid.to_numpy()).rank(pct=True).to_numpy()
+        parts = {}
         if args.mlp:
-            s_mlp = mlp_scores(args.mlp, args.data_dir)
-            rank = lambda s: pd.Series(s).groupby(feats.qid.to_numpy()).rank(pct=True).to_numpy()
-            feats["score"] = rank(s_mlp) if args.mlp_only else rank(s_lgb) + rank(s_mlp)
-        else:
-            feats["score"] = s_lgb
+            parts["mlp"] = mlp_scores(args.mlp, args.data_dir)
+        features = None
+        if args.model:
+            model_dir = ROOT / "models" / args.model
+            config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+            features = config["features"]
+            booster = lgb.Booster(model_str=(model_dir / "model.txt").read_text(encoding="utf-8"))
+            parts["lgbm"] = booster.predict(prepare_categorical(feats[features].copy()))
+        # одна модель — её скор; две — сумма рангов внутри запроса, как на валидации
+        feats["score"] = (list(parts.values())[0] if len(parts) == 1
+                          else sum(rank(s) for s in parts.values()))
         feats = feats.sort_values(["qid", "score"], ascending=[True, False], kind="stable")
         feats["rank"] = feats.groupby("qid").cumcount() + 1
         top = feats[feats["rank"] <= args.top_k]
@@ -130,8 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         save_answer(answer, out / "answer.csv")
         predictions.to_parquet(out / "predictions.parquet", index=False)
         (out / "config.json").write_text(json.dumps(
-            {"model": args.model, "mlp": args.mlp, "mlp_only": args.mlp_only,
-             "top_k": args.top_k, "features": features},
+            {"model": args.model, "mlp": args.mlp, "top_k": args.top_k, "features": features},
             ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"answer.csv: {out / 'answer.csv'}")
     log(f"готово за {(time.time() - t_start) / 60:.1f} мин")
