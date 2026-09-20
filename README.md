@@ -84,26 +84,32 @@ python run/train_mlp.py --text-emb e5-large --name mlp_nb_text  # ~6 мин
 python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин
 ```
 
-### В. Только обучение модели и ответ — примерно 20 минут
+### В. Без отбора кандидатов и признаков — примерно 30 минут
 
-Скачиваем готовые признаки (966 МБ для обучения и 51 МБ для бенчмарка), сразу
-обучаем переранжировщик и собираем ответ. Сырые данные задания при этом не нужны.
+Скачиваем готовые признаки (1.0 ГБ для обучения и 51 МБ для бенчмарка) и векторы
+e5 (764 МБ), пропуская два самых долгих счётных шага — кандидатов и признаки
+(~85 минут). Данные задания всё равно нужны: из них берутся каталог валидации и
+атрибуты объявлений (категория и локация), которых нет в выложенных признаках.
 
 ```bash
-python run/artifacts.py --sets train rerank                # ~10 мин  зависит от скорости сети
+python run/preprocess.py                                   # ~3 мин   чистка и разбор параметров объявлений
+python run/make_split.py                                   # ~10 с    train/val и каталог для валидации
+python run/artifacts.py --sets train rerank e5-catalog e5-benchmark  # ~20 мин  зависит от скорости сети
 python run/train_mlp.py --text-emb e5-large --name mlp_nb_text  # ~6 мин  обучение и метрики на валидации
 python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин   ответ
 ```
 
 Обучение печатает те же метрики на валидации, что приведены в
-[SOLUTION.md](SOLUTION.md).
+[SOLUTION.md](SOLUTION.md), кроме колонки сравнения с первым этапом: она берётся
+из `results/retrievers_regions/`, а он считается отдельной командой
+(`run/evaluate_retrievers.py`, сценарий А или Б).
 
 **Ещё быстрее:** веса обученной модели лежат в репозитории
-(`models/mlp_nb_text/`, 1.8 МБ), поэтому обучение можно пропустить и получить
-ответ за минуту:
+(`models/mlp_nb_text/`, 1.8 МБ), поэтому обучение можно пропустить:
 
 ```bash
-python run/artifacts.py --sets rerank                      # ~1 мин   51 МБ
+python run/preprocess.py                                   # ~3 мин
+python run/artifacts.py --sets rerank e5-benchmark         # ~5 мин   51 + 382 МБ
 python run/rerank_benchmark.py --mlp mlp_nb_text           # ~1 мин
 ```
 

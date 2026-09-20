@@ -9,10 +9,15 @@
 * `rerank` (~51 МБ) — кандидаты, признаки и векторы запросов бенчмарка в
   `dataset/rerank/`. С ними ответ собирается одной командой
   `run/rerank_benchmark.py --mlp mlp_nb_text` за минуту.
-* `train` (~966 МБ) — признаки и события train и val: с ними можно обучить
+* `train` (~1.0 ГБ) — признаки и события train и val: с ними можно обучить
   переранжировщик заново (`run/train_mlp.py`) и повторить метрики на валидации.
 * `embeddings` (~1.5 ГБ) — эмбеддинги каталога валидации и корпуса бенчмарка
   обеими dense-моделями в `dataset/embeddings/`: экономит ~4 часа кодирования на GPU.
+* `e5-catalog` и `e5-benchmark` (по ~382 МБ) — части того же кэша: только векторы
+  e5-large для каталога валидации и для корпуса бенчмарка. Столько нужно, если
+  кандидаты не пересчитываются (RoSBERTa нужна только им), а векторы e5 идут в
+  текстовую часть MLP: `e5-catalog` — для `run/train_mlp.py --text-emb e5-large`,
+  `e5-benchmark` — для `run/rerank_benchmark.py --mlp mlp_nb_text`.
 
     python run/artifacts.py --sets rerank
     python run/artifacts.py --sets rerank train
@@ -43,6 +48,9 @@ SETS = {
                        "query_emb_e5-large_train_val.texts.npy"]),
     # кэш эмбеддингов каталога валидации и корпуса бенчмарка
     "embeddings": (EMBEDDINGS, ["e5-large/*", "RoSBERTa/*", "benchmark/*"]),
+    # только e5: векторы текстовой части MLP, без RoSBERTa (она нужна лишь кандидатам)
+    "e5-catalog": (EMBEDDINGS, ["e5-large/*"]),
+    "e5-benchmark": (EMBEDDINGS, ["benchmark/e5-large/*"]),
 }
 
 
