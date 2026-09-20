@@ -23,9 +23,13 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import sys
 import time
 from pathlib import Path
+
+# порядок редукции в cuBLAS фиксируется до первой операции на GPU (--deterministic)
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
@@ -140,6 +144,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--patience", type=int, default=2)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--deterministic", action=argparse.BooleanOptionalAction, default=True,
+                        help="побитово воспроизводимое обучение на той же машине "
+                             "(на другой GPU или версии torch совпадения всё равно не будет)")
     parser.add_argument("--text-emb", default=None, choices=[None, "e5-large", "RoSBERTa"],
                         help="подавать в сеть векторы запроса и объявления этой модели")
     parser.add_argument("--text-dim", type=int, default=64,
@@ -148,6 +155,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     t_start = time.time()
     torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
     rng = np.random.default_rng(args.seed)
     log(f"MLP-переранжировщик: {args.name}")
 

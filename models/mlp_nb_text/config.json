@@ -1,7 +1,11 @@
 {
   "type": "mlp",
   "data_dir": "D:\\Career\\Задания с кодом\\Search-Retrieval\\dataset\\rerank",
-  "features_from": "lgbm_nb",
+  "drop_features": [
+    "st_item_pop_log",
+    "st_text_item"
+  ],
+  "compare_lgbm": null,
   "baseline": "retrievers_regions",
   "hidden": [
     256,
@@ -15,6 +19,7 @@
   "patience": 2,
   "top_k": 50,
   "seed": 0,
+  "deterministic": true,
   "text_emb": "e5-large",
   "text_dim": 64,
   "name": "mlp_nb_text",
@@ -65,5 +70,5 @@
     "st_loc_share",
     "st_loc_pos_log"
   ],
-  "best_tune_recall": 0.9432136190282543
+  "best_tune_recall": 0.9426127743987609
 }
